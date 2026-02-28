@@ -16,6 +16,9 @@ dependencies:
   # UI & Charts
   fl_chart: ^0.70.2
 
+  # Maps
+  google_maps_flutter: ^2.9.0
+
   # Storage
   shared_preferences: ^2.5.3
 

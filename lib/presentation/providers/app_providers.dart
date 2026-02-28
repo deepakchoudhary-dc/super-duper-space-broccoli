@@ -8,6 +8,7 @@ import '../../data/services/places_service.dart';
 import '../../data/services/weather_service.dart';
 import '../../data/services/currency_service.dart';
 import '../../data/services/route_optimizer_service.dart';
+import '../../data/services/offline_map_service.dart';
 import '../../data/repositories/trip_repository.dart';
 import '../../data/repositories/expense_repository.dart';
 
@@ -20,6 +21,7 @@ final placesServiceProvider = Provider<PlacesService>((_) => PlacesService());
 final weatherServiceProvider = Provider<WeatherService>((_) => WeatherService());
 final currencyServiceProvider = Provider<CurrencyService>((_) => CurrencyService());
 final routeOptimizerProvider = Provider<RouteOptimizerService>((_) => RouteOptimizerService());
+final offlineMapServiceProvider = Provider<OfflineMapService>((_) => OfflineMapService());
 
 // ═══════════════════════════════════════════════════════════════════════
 //  REPOSITORY PROVIDERS
