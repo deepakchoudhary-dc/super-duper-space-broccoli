@@ -13,6 +13,10 @@ dependencies:
   # State Management
   flutter_riverpod: ^2.6.1
 
+  # Maps
+  google_maps_flutter: ^2.10.0
+  google_maps_flutter_web: ^0.5.10
+
   # UI & Charts
   fl_chart: ^0.70.2
 

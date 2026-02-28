@@ -25,11 +25,13 @@ This app integrates with several third-party services. You'll need to obtain API
 - Enable the following APIs:
   - Maps SDK for Android
   - Maps SDK for iOS
+  - **Maps JavaScript API** (required for Flutter Web)
   - Places API
   - Geocoding API
   - Distance Matrix API
 - Create credentials (API Key)
 - Restrict the key appropriately
+- For web: replace `YOUR_GOOGLE_MAPS_API_KEY` in `web/index.html` with your actual key
 
 ### 2. OpenAI API
 - Visit [OpenAI Platform](https://platform.openai.com/)
