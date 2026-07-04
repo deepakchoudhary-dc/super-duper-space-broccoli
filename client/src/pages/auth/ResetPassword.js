@@ -95,25 +95,7 @@ const ResetPassword = () => {
 
   if (!tokenValid) {
     return (
-      <Container component="main" maxWidth="sm">
-        <Box
-          sx={{
-            marginTop: 8,
-            display: 'flex',
-            flexDirection: 'column',
-            alignItems: 'center',
-          }}
-        >
-          <Paper
-            elevation={3}
-            sx={{
-              padding: 4,
-              display: 'flex',
-              flexDirection: 'column',
-              alignItems: 'center',
-              width: '100%',
-            }}
-          >
+      <Box sx={{ width: '100%', display: 'flex', flexDirection: 'column', padding: 4, alignItems: 'center' }}>
             <Typography component="h1" variant="h4" sx={{ mb: 2 }}>
               Invalid Reset Link
             </Typography>
@@ -128,32 +110,12 @@ const ResetPassword = () => {
                 Request a new reset link
               </Link>
             </Box>
-          </Paper>
-        </Box>
-      </Container>
+      </Box>
     );
   }
 
   return (
-    <Container component="main" maxWidth="sm">
-      <Box
-        sx={{
-          marginTop: 8,
-          display: 'flex',
-          flexDirection: 'column',
-          alignItems: 'center',
-        }}
-      >
-        <Paper
-          elevation={3}
-          sx={{
-            padding: 4,
-            display: 'flex',
-            flexDirection: 'column',
-            alignItems: 'center',
-            width: '100%',
-          }}
-        >
+    <Box sx={{ width: '100%', display: 'flex', flexDirection: 'column', padding: 4, alignItems: 'center' }}>
           <Typography component="h1" variant="h4" sx={{ mb: 2 }}>
             Reset Password
           </Typography>
@@ -268,9 +230,7 @@ const ResetPassword = () => {
               Back to Login
             </Link>
           </Box>
-        </Paper>
-      </Box>
-    </Container>
+    </Box>
   );
 };
 

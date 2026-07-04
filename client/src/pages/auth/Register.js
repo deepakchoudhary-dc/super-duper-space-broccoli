@@ -110,16 +110,7 @@ const Register = () => {  const [formData, setFormData] = useState({
 
   if (success) {
     return (
-      <Container component="main" maxWidth="sm">
-        <Box
-          sx={{
-            marginTop: 8,
-            display: 'flex',
-            flexDirection: 'column',
-            alignItems: 'center',
-          }}
-        >
-          <Paper elevation={3} sx={{ padding: 4, width: '100%', borderRadius: 2 }}>
+      <Box sx={{ width: '100%', display: 'flex', flexDirection: 'column' }}>
             <Box sx={{ textAlign: 'center' }}>
               <Typography variant="h3" sx={{ mb: 2, color: 'success.main' }}>
                 ✅
@@ -138,30 +129,12 @@ const Register = () => {  const [formData, setFormData] = useState({
                 Go to Login
               </Button>
             </Box>
-          </Paper>
-        </Box>
-      </Container>
+      </Box>
     );
   }
 
   return (
-    <Container component="main" maxWidth="sm">
-      <Box
-        sx={{
-          marginTop: 8,
-          display: 'flex',
-          flexDirection: 'column',
-          alignItems: 'center',
-        }}
-      >
-        <Paper 
-          elevation={3} 
-          sx={{ 
-            padding: 4, 
-            width: '100%',
-            borderRadius: 2
-          }}
-        >
+    <Box sx={{ width: '100%', display: 'flex', flexDirection: 'column' }}>
           <Box sx={{ textAlign: 'center', mb: 3 }}>
             <Typography variant="h3" sx={{ mb: 1, fontWeight: 'bold' }}>
               🛡️
@@ -366,9 +339,7 @@ const Register = () => {  const [formData, setFormData] = useState({
               </Typography>
             </Box>
           </Box>
-        </Paper>
-      </Box>
-    </Container>
+    </Box>
   );
 };
 

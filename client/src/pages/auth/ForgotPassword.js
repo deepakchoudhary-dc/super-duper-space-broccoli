@@ -46,30 +46,11 @@ const ForgotPassword = () => {
   };
 
   return (
-    <Container component="main" maxWidth="sm">
-      <Box
-        sx={{
-          marginTop: 8,
-          display: 'flex',
-          flexDirection: 'column',
-          alignItems: 'center',
-        }}
-      >
-        <Paper
-          elevation={3}
-          sx={{
-            padding: 4,
-            display: 'flex',
-            flexDirection: 'column',
-            alignItems: 'center',
-            width: '100%',
-          }}
-        >
-          <Typography component="h1" variant="h4" sx={{ mb: 2 }}>
-            Forgot Password
-          </Typography>
-          
-          <Typography variant="body2" color="text.secondary" sx={{ mb: 3, textAlign: 'center' }}>
+    <Box sx={{ width: '100%', display: 'flex', flexDirection: 'column' }}>
+      <Typography component="h1" variant="h4" sx={{ mb: 2, fontWeight: 'bold', textAlign: 'center' }}>
+        Forgot Password
+      </Typography>
+      <Typography variant="body2" color="text.secondary" sx={{ mb: 3, textAlign: 'center' }}>
             {submitted
               ? "We've sent you an email with instructions to reset your password."
               : "Enter your email address and we'll send you instructions to reset your password."
@@ -128,9 +109,7 @@ const ForgotPassword = () => {
               Back to Login
             </Link>
           </Box>
-        </Paper>
-      </Box>
-    </Container>
+    </Box>
   );
 };
 

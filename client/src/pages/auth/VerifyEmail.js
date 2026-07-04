@@ -83,38 +83,19 @@ const VerifyEmail = () => {
   };
 
   return (
-    <Container component="main" maxWidth="sm">
-      <Box
-        sx={{
-          marginTop: 8,
-          display: 'flex',
-          flexDirection: 'column',
-          alignItems: 'center',
-        }}
-      >
-        <Paper
-          elevation={3}
-          sx={{
-            padding: 4,
-            display: 'flex',
-            flexDirection: 'column',
-            alignItems: 'center',
-            width: '100%',
-            textAlign: 'center'
-          }}
-        >
-          {getIcon()}
-          
-          <Typography component="h1" variant="h4" sx={{ mb: 2 }}>
-            {getTitle()}
-          </Typography>
+    <Box sx={{ width: '100%', display: 'flex', flexDirection: 'column', padding: 4, alignItems: 'center', textAlign: 'center' }}>
+      {getIcon()}
+      
+      <Typography component="h1" variant="h4" sx={{ mb: 2 }}>
+        {getTitle()}
+      </Typography>
 
-          <Alert 
-            severity={status === 'success' ? 'success' : status === 'error' ? 'error' : 'info'} 
-            sx={{ width: '100%', mb: 3 }}
-          >
-            {message}
-          </Alert>
+      <Alert 
+        severity={status === 'success' ? 'success' : status === 'error' ? 'error' : 'info'} 
+        sx={{ width: '100%', mb: 3 }}
+      >
+        {message}
+      </Alert>
 
           <Box sx={{ mt: 2, display: 'flex', flexDirection: 'column', gap: 2, width: '100%' }}>
             {status === 'success' && (
@@ -159,9 +140,7 @@ const VerifyEmail = () => {
               Back to Login
             </Button>
           </Box>
-        </Paper>
-      </Box>
-    </Container>
+    </Box>
   );
 };
 

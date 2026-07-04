@@ -102,25 +102,7 @@ const TwoFactorAuth = () => {
   }
 
   return (
-    <Container component="main" maxWidth="sm">
-      <Box
-        sx={{
-          marginTop: 8,
-          display: 'flex',
-          flexDirection: 'column',
-          alignItems: 'center',
-        }}
-      >
-        <Paper
-          elevation={3}
-          sx={{
-            padding: 4,
-            display: 'flex',
-            flexDirection: 'column',
-            alignItems: 'center',
-            width: '100%',
-          }}
-        >
+    <Box sx={{ width: '100%', display: 'flex', flexDirection: 'column', padding: 4, alignItems: 'center' }}>
           <Box
             sx={{
               display: 'flex',
@@ -222,9 +204,7 @@ const TwoFactorAuth = () => {
               Back to Login
             </Button>
           </Box>
-        </Paper>
-      </Box>
-    </Container>
+    </Box>
   );
 };
 
