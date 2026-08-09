@@ -314,7 +314,7 @@ const APIKeys = () => {
                 onChange={(e) => setFilters({ ...filters, api: e.target.value })}
               >
                 <MenuItem value="all">All APIs</MenuItem>
-                {apis.map(api => (
+                {(Array.isArray(apis) ? apis : []).map(api => (
                   <MenuItem key={api.id} value={api.id}>
                     {api.name}
                   </MenuItem>

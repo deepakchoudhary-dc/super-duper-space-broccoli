@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS users (
   failed_login_attempts INTEGER DEFAULT 0,
   locked_until TIMESTAMP,
   last_login TIMESTAMP,
+  settings JSONB DEFAULT '{}',
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );

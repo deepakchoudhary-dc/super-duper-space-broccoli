@@ -46,9 +46,12 @@ services:
       DB_PASSWORD: postgres_password
       REDIS_HOST: redis
       REDIS_PORT: 6379
+      JWT_ACCESS_SECRET: api-guardian-access-super-secret-key-32chars
+      JWT_REFRESH_SECRET: api-guardian-refresh-super-secret-key-32chars
       JWT_SECRET: your-super-secret-jwt-key-change-this-in-production
       JWT_EXPIRES_IN: 7d
       JWT_REFRESH_EXPIRES_IN: 30d
+      SKIP_EMAIL_VERIFICATION: "true"
       FRONTEND_URL: http://localhost:3000
       API_GUARDIAN_DOMAIN: http://localhost:5000
     ports:

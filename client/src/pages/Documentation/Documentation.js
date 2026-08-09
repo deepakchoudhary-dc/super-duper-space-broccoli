@@ -109,10 +109,12 @@ const Documentation = () => {
 
   const fetchAPIs = async () => {
     try {
-      const response = await apiService.get('/apis');
-      setApis(response.data || []);
+      const response = await apiService.get('/api/apis');
+      const apisList = response.data?.data?.apis || response.data?.apis || (Array.isArray(response.data?.data) ? response.data.data : []);
+      setApis(Array.isArray(apisList) ? apisList : []);
     } catch (error) {
       console.error('Error fetching APIs:', error);
+      setApis([]);
     }
   };
 
@@ -352,8 +354,8 @@ const Documentation = () => {
                   </Button>
                 </Alert>
               ) : (
-                <List sx={{ py: 0 }}>
-                  {apis.slice(0, 3).map((api) => (
+                <List>
+                  {(Array.isArray(apis) ? apis.slice(0, 3) : []).map((api) => (
                     <ListItem
                       key={api.id}
                       sx={{ px: 0, cursor: 'pointer' }}
@@ -375,7 +377,7 @@ const Documentation = () => {
                       <Button
                         size="small"
                         fullWidth
-                        onClick={() => navigate('/documentation/apis')}
+                        onClick={() => navigate('/apis')}
                       >
                         View {apis.length - 3} more APIs
                       </Button>

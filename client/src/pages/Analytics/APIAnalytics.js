@@ -88,8 +88,9 @@ const APIAnalytics = () => {
 
   const fetchAPIDetails = async () => {
     try {
-      const response = await apiService.get(`/apis/${id}`);
-      setApi(response.data);
+      const response = await apiService.get(`/api/apis/${id}`);
+      const apiData = response.data?.data?.api || response.data?.data || response.data;
+      setApi(apiData);
     } catch (error) {
       console.error('Error fetching API details:', error);
       toast.error('Failed to load API details');
@@ -388,7 +389,7 @@ const APIAnalytics = () => {
               Top Endpoints
             </Typography>
             <List>
-              {analytics.topEndpoints?.map((endpoint, index) => (
+              {(Array.isArray(analytics.topEndpoints) ? analytics.topEndpoints : []).map((endpoint, index) => (
                 <ListItem key={index} divider>
                   <ListItemText
                     primary={
@@ -418,7 +419,7 @@ const APIAnalytics = () => {
               Recent Errors
             </Typography>
             <Divider sx={{ mb: 2 }} />
-            {analytics.recentErrors?.length > 0 ? (
+            {Array.isArray(analytics.recentErrors) && analytics.recentErrors.length > 0 ? (
               <TableContainer>
                 <Table>
                   <TableHead>

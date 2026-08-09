@@ -115,11 +115,22 @@ const Dashboard = () => {
         userAPI.getAlerts()
       ]);
 
-      console.log('Dashboard: Got responses:', { statsResponse, activityResponse, alertsResponse });
+      const statsData = statsResponse?.data?.data || statsResponse?.data || {};
+      const activityData = activityResponse?.data?.data || activityResponse?.data || [];
+      const alertsData = alertsResponse?.data?.data || alertsResponse?.data || [];
 
-      setStats(statsResponse.data);
-      setRecentActivity(activityResponse.data);
-      setAlerts(alertsResponse.data);
+      setStats(prev => ({
+        apis: statsData.apis ?? prev.apis ?? 0,
+        keys: statsData.keys ?? prev.keys ?? 0,
+        requests: statsData.requests ?? prev.requests ?? 0,
+        uptime: statsData.uptime || prev.uptime || '99.9%'
+      }));
+      if (Array.isArray(activityData) && activityData.length > 0) {
+        setRecentActivity(activityData);
+      }
+      if (Array.isArray(alertsData) && alertsData.length > 0) {
+        setAlerts(alertsData);
+      }
 
       // Mock chart data
       setChartData({
@@ -256,7 +267,7 @@ const Dashboard = () => {
           <Button
             variant="contained"
             startIcon={<Add />}
-            onClick={() => navigate('/apis/new')}
+            onClick={() => navigate('/apis/create')}
           >
             Add API
           </Button>

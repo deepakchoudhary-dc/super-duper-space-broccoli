@@ -70,8 +70,11 @@ const SecuritySettings = () => {
   // 2FA states
   const [twoFAEnabled, setTwoFAEnabled] = useState(false);
   const [twoFADialog, setTwoFADialog] = useState(false);
+  const [twoFADisableDialog, setTwoFADisableDialog] = useState(false);
   const [qrCode, setQrCode] = useState('');
+  const [twoFASecret, setTwoFASecret] = useState('');
   const [verificationCode, setVerificationCode] = useState('');
+  const [disableVerificationCode, setDisableVerificationCode] = useState('');
   const [backupCodes, setBackupCodes] = useState([]);
 
   // Security settings
@@ -91,14 +94,17 @@ const SecuritySettings = () => {
 
   const fetchSecurityData = async () => {
     try {
-      const [settingsResponse, sessionsResponse] = await Promise.all([
-        api.get('/api/user/security-settings'),
-        api.get('/api/user/sessions')
+      const [settingsResponse, meResponse] = await Promise.all([
+        api.get('/api/settings').catch(() => ({ data: { data: {} } })),
+        api.get('/api/auth/me').catch(() => ({ data: { data: {} } }))
       ]);
 
-      setSecuritySettings(settingsResponse.data.data.settings);
-      setTwoFAEnabled(settingsResponse.data.data.twoFactorEnabled);
-      setActiveSessions(sessionsResponse.data.data);
+      if (settingsResponse.data?.data?.settings?.security) {
+        setSecuritySettings(prev => ({ ...prev, ...settingsResponse.data.data.settings.security }));
+      }
+      if (meResponse.data?.data?.user) {
+        setTwoFAEnabled(meResponse.data.data.user.twoFactorEnabled || false);
+      }
     } catch (error) {
       console.error('Failed to fetch security data:', error);
       // Mock data for development
@@ -147,7 +153,7 @@ const SecuritySettings = () => {
 
     setLoading(true);
     try {
-      await api.post('/api/user/change-password', {
+      await api.post('/api/users/change-password', {
         currentPassword: passwordForm.currentPassword,
         newPassword: passwordForm.newPassword
       });
@@ -167,9 +173,10 @@ const SecuritySettings = () => {
 
   const handleEnable2FA = async () => {
     try {
-      const response = await api.post('/api/user/2fa/setup');
+      const response = await api.post('/api/auth/setup-2fa');
       setQrCode(response.data.data.qrCode);
-      setBackupCodes(response.data.data.backupCodes);
+      setTwoFASecret(response.data.data.secret);
+      setBackupCodes(response.data.data.backupCodes || []);
       setTwoFADialog(true);
     } catch (err) {
       setError(err.response?.data?.message || 'Failed to setup 2FA');
@@ -184,8 +191,9 @@ const SecuritySettings = () => {
 
     setLoading(true);
     try {
-      await api.post('/api/user/2fa/verify', {
-        code: verificationCode
+      await api.post('/api/auth/enable-2fa', {
+        secret: twoFASecret,
+        token: verificationCode
       });
       
       setTwoFAEnabled(true);
@@ -200,10 +208,19 @@ const SecuritySettings = () => {
   };
 
   const handleDisable2FA = async () => {
+    if (disableVerificationCode.length !== 6) {
+      setError('Please enter a 6-digit verification code to disable 2FA');
+      return;
+    }
+
     setLoading(true);
     try {
-      await api.post('/api/user/2fa/disable');
+      await api.post('/api/auth/disable-2fa', {
+        token: disableVerificationCode
+      });
       setTwoFAEnabled(false);
+      setTwoFADisableDialog(false);
+      setDisableVerificationCode('');
       setMessage('Two-factor authentication disabled');
     } catch (err) {
       setError(err.response?.data?.message || 'Failed to disable 2FA');
@@ -214,14 +231,16 @@ const SecuritySettings = () => {
 
   const handleSettingChange = async (setting, value) => {
     try {
-      await api.put('/api/user/security-settings', {
-        [setting]: value
-      });
-      
-      setSecuritySettings({
+      const updatedSettings = {
         ...securitySettings,
         [setting]: value
+      };
+      
+      await api.put('/api/settings', {
+        security: updatedSettings
       });
+      
+      setSecuritySettings(updatedSettings);
     } catch (err) {
       setError(err.response?.data?.message || 'Failed to update setting');
     }
@@ -413,10 +432,10 @@ const SecuritySettings = () => {
                   <Button
                     variant="outlined"
                     color="error"
-                    onClick={handleDisable2FA}
+                    onClick={() => setTwoFADisableDialog(true)}
                     disabled={loading}
                   >
-                    {loading ? <CircularProgress size={20} /> : 'Disable 2FA'}
+                    Disable 2FA
                   </Button>
                 </Box>
               ) : (
@@ -506,7 +525,7 @@ const SecuritySettings = () => {
                     </TableRow>
                   </TableHead>
                   <TableBody>
-                    {activeSessions.map((session) => (
+                    {(Array.isArray(activeSessions) ? activeSessions : []).map((session) => (
                       <TableRow key={session.id}>
                         <TableCell>
                           <Box display="flex" alignItems="center">
@@ -599,11 +618,9 @@ const SecuritySettings = () => {
                   <strong>Important:</strong> Save these backup codes in a secure location. 
                   You can use them to access your account if you lose your authenticator device.
                 </Typography>
-                <Box mt={1} sx={{ fontFamily: 'monospace', fontSize: '0.9rem' }}>
-                  {backupCodes.map((code, index) => (
-                    <Typography key={index} variant="body2">
-                      {code}
-                    </Typography>
+                <Box display="flex" flexWrap="wrap" gap={1} mb={2}>
+                  {(Array.isArray(backupCodes) ? backupCodes : []).map((code, index) => (
+                    <Chip key={index} label={code} variant="outlined" />
                   ))}
                 </Box>
               </Alert>
@@ -620,6 +637,39 @@ const SecuritySettings = () => {
             disabled={loading || verificationCode.length !== 6}
           >
             {loading ? <CircularProgress size={20} /> : 'Verify & Enable'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* 2FA Disable Dialog */}
+      <Dialog open={twoFADisableDialog} onClose={() => setTwoFADisableDialog(false)} maxWidth="xs" fullWidth>
+        <DialogTitle>Disable Two-Factor Authentication</DialogTitle>
+        <DialogContent>
+          <Typography variant="body2" sx={{ mb: 2 }}>
+            Please enter your 6-digit authentication code to confirm disabling 2FA:
+          </Typography>
+          <TextField
+            fullWidth
+            label="Verification Code"
+            value={disableVerificationCode}
+            onChange={(e) => setDisableVerificationCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+            inputProps={{
+              style: { textAlign: 'center', fontSize: '1.2rem', letterSpacing: '0.5rem' }
+            }}
+            placeholder="000000"
+          />
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setTwoFADisableDialog(false)}>
+            Cancel
+          </Button>
+          <Button
+            onClick={handleDisable2FA}
+            variant="contained"
+            color="error"
+            disabled={loading || disableVerificationCode.length !== 6}
+          >
+            {loading ? <CircularProgress size={20} /> : 'Confirm Disable'}
           </Button>
         </DialogActions>
       </Dialog>

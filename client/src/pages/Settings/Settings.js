@@ -94,6 +94,9 @@ const Settings = () => {
   const [loading, setLoading] = useState(false);
   const [resetDialogOpen, setResetDialogOpen] = useState(false);
   const [deleteAccountDialogOpen, setDeleteAccountDialogOpen] = useState(false);
+  const [deletePassword, setDeletePassword] = useState('');
+  const [deleteConfirmText, setDeleteConfirmText] = useState('');
+  const [deletingAccount, setDeletingAccount] = useState(false);
   const [newIpAddress, setNewIpAddress] = useState('');
 
   useEffect(() => {
@@ -102,11 +105,14 @@ const Settings = () => {
 
   const fetchSettings = async () => {
     try {
-      const response = await apiService.get('/settings');
-      setSettings(prevSettings => ({
-        ...prevSettings,
-        ...response.data
-      }));
+      const response = await apiService.get('/api/settings');
+      const backendSettings = response.data?.data?.settings || response.data?.settings || response.data;
+      if (backendSettings) {
+        setSettings(prevSettings => ({
+          ...prevSettings,
+          ...backendSettings
+        }));
+      }
     } catch (error) {
       console.error('Error fetching settings:', error);
     }
@@ -123,7 +129,7 @@ const Settings = () => {
   const handleSaveSettings = async () => {
     try {
       setLoading(true);
-      await apiService.put('/settings', settings);
+      await apiService.put('/api/settings', settings);
       toast.success('Settings saved successfully');
     } catch (error) {
       console.error('Error saving settings:', error);
@@ -135,14 +141,44 @@ const Settings = () => {
 
   const handleResetSettings = async () => {
     try {
-      await apiService.post('/settings/reset');
-      fetchSettings();
+      await apiService.post('/api/settings/reset');
+      await fetchSettings();
       toast.success('Settings reset to defaults');
     } catch (error) {
       console.error('Error resetting settings:', error);
       toast.error('Failed to reset settings');
     } finally {
       setResetDialogOpen(false);
+    }
+  };
+
+  const handleDeleteAccount = async () => {
+    if (deleteConfirmText !== 'DELETE') {
+      toast.error("Please type 'DELETE' to confirm account deletion");
+      return;
+    }
+    if (!deletePassword) {
+      toast.error('Password is required for account deletion');
+      return;
+    }
+
+    try {
+      setDeletingAccount(true);
+      await apiService.delete('/api/settings/delete-account', {
+        data: {
+          password: deletePassword,
+          confirmation: 'DELETE'
+        }
+      });
+      toast.success('Account deleted successfully');
+      setDeleteAccountDialogOpen(false);
+      localStorage.clear();
+      window.location.href = '/login';
+    } catch (error) {
+      console.error('Error deleting account:', error);
+      toast.error(error.response?.data?.message || 'Failed to delete account');
+    } finally {
+      setDeletingAccount(false);
     }
   };
 
@@ -447,7 +483,7 @@ const Settings = () => {
                     Add
                   </Button>
                 </Box>
-                {settings.ipWhitelist.length > 0 && (
+                {Array.isArray(settings.ipWhitelist) && settings.ipWhitelist.length > 0 && (
                   <Box display="flex" flexWrap="wrap" gap={1}>
                     {settings.ipWhitelist.map((ip) => (
                       <Chip
@@ -604,42 +640,67 @@ const Settings = () => {
       />
 
       {/* Delete Account Dialog */}
-      <ConfirmDialog
+      <Dialog
         open={deleteAccountDialogOpen}
         onClose={() => setDeleteAccountDialogOpen(false)}
-        onConfirm={() => {
-          // Handle account deletion
-          toast.error('Account deletion not implemented yet');
-          setDeleteAccountDialogOpen(false);
-        }}
-        title="Delete Account"
-        content={
-          <Box>
-            <Typography gutterBottom>
-              Are you sure you want to delete your account? This will permanently remove all your data including:
-            </Typography>
-            <List dense>
-              <ListItem>
-                <ListItemText primary="• All registered APIs" />
-              </ListItem>
-              <ListItem>
-                <ListItemText primary="• All API keys" />
-              </ListItem>
-              <ListItem>
-                <ListItemText primary="• Usage analytics and logs" />
-              </ListItem>
-              <ListItem>
-                <ListItemText primary="• Account settings and preferences" />
-              </ListItem>
-            </List>
-            <Alert severity="error" sx={{ mt: 2 }}>
-              This action cannot be undone!
-            </Alert>
-          </Box>
-        }
-        confirmText="Delete Account"
-        confirmColor="error"
-      />
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle sx={{ color: 'error.main' }}>
+          Delete Account
+        </DialogTitle>
+        <DialogContent>
+          <Typography gutterBottom>
+            Are you sure you want to permanently delete your account? This action cannot be undone.
+          </Typography>
+          <List dense>
+            <ListItem>
+              <ListItemText primary="• All registered APIs will be deleted" />
+            </ListItem>
+            <ListItem>
+              <ListItemText primary="• All API keys will be revoked immediately" />
+            </ListItem>
+            <ListItem>
+              <ListItemText primary="• All usage analytics and logs will be permanently removed" />
+            </ListItem>
+          </List>
+          <Alert severity="error" sx={{ my: 2 }}>
+            This action is irreversible!
+          </Alert>
+          <TextField
+            fullWidth
+            label="Enter Password"
+            type="password"
+            value={deletePassword}
+            onChange={(e) => setDeletePassword(e.target.value)}
+            margin="normal"
+            required
+          />
+          <TextField
+            fullWidth
+            label="Type 'DELETE' to confirm"
+            value={deleteConfirmText}
+            onChange={(e) => setDeleteConfirmText(e.target.value)}
+            margin="normal"
+            placeholder="DELETE"
+            required
+            helperText="Please type DELETE in all uppercase"
+          />
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setDeleteAccountDialogOpen(false)}>
+            Cancel
+          </Button>
+          <Button
+            onClick={handleDeleteAccount}
+            variant="contained"
+            color="error"
+            disabled={deletingAccount || deleteConfirmText !== 'DELETE' || !deletePassword}
+          >
+            {deletingAccount ? 'Deleting...' : 'Delete Account Permanently'}
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Box>
   );
 };

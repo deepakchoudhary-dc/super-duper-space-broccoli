@@ -80,7 +80,7 @@ const Profile = () => {
     setMessage('');
 
     try {
-      const response = await api.put('/api/user/profile', formData);
+      const response = await api.put('/api/users/profile', formData);
       await updateUser(response.data.data);
       setMessage('Profile updated successfully');
       setEditing(false);

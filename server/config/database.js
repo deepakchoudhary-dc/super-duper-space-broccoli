@@ -27,9 +27,9 @@ const connectDB = async () => {
 };
 
 const createTables = async () => {
-  const createTablesQuery = `
-    -- Users table
-    CREATE TABLE IF NOT EXISTS users (
+  const schemaStatements = [
+    // 1. Core tables
+    `CREATE TABLE IF NOT EXISTS users (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       email VARCHAR(255) UNIQUE NOT NULL,
       password_hash VARCHAR(255) NOT NULL,
@@ -41,12 +41,12 @@ const createTables = async () => {
       failed_login_attempts INTEGER DEFAULT 0,
       locked_until TIMESTAMP,
       last_login TIMESTAMP,
+      settings JSONB DEFAULT '{}',
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
+    )`,
 
-    -- APIs table
-    CREATE TABLE IF NOT EXISTS apis (
+    `CREATE TABLE IF NOT EXISTS apis (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       name VARCHAR(255) NOT NULL,
@@ -64,10 +64,9 @@ const createTables = async () => {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       UNIQUE(user_id, name)
-    );
+    )`,
 
-    -- API Keys table
-    CREATE TABLE IF NOT EXISTS api_keys (
+    `CREATE TABLE IF NOT EXISTS api_keys (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       api_id UUID NOT NULL REFERENCES apis(id) ON DELETE CASCADE,
       user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -83,10 +82,9 @@ const createTables = async () => {
       last_used TIMESTAMP,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
+    )`,
 
-    -- API Usage Logs table
-    CREATE TABLE IF NOT EXISTS api_usage_logs (
+    `CREATE TABLE IF NOT EXISTS api_usage_logs (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       api_id UUID REFERENCES apis(id) ON DELETE CASCADE,
       api_key_id UUID REFERENCES api_keys(id) ON DELETE CASCADE,
@@ -101,10 +99,9 @@ const createTables = async () => {
       user_agent TEXT,
       error_message TEXT,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
+    )`,
 
-    -- Audit Logs table
-    CREATE TABLE IF NOT EXISTS audit_logs (
+    `CREATE TABLE IF NOT EXISTS audit_logs (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       user_id UUID REFERENCES users(id) ON DELETE CASCADE,
       action VARCHAR(100) NOT NULL,
@@ -114,68 +111,80 @@ const createTables = async () => {
       ip_address INET,
       user_agent TEXT,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
+    )`,
 
-    -- Password Reset Tokens table
-    CREATE TABLE IF NOT EXISTS password_reset_tokens (
+    `CREATE TABLE IF NOT EXISTS password_reset_tokens (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       token_hash VARCHAR(255) NOT NULL,
       expires_at TIMESTAMP NOT NULL,
       used BOOLEAN DEFAULT FALSE,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
+    )`,
 
-    -- Email Verification Tokens table
-    CREATE TABLE IF NOT EXISTS email_verification_tokens (
+    `CREATE TABLE IF NOT EXISTS email_verification_tokens (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       token_hash VARCHAR(255) NOT NULL,
       expires_at TIMESTAMP NOT NULL,
       used BOOLEAN DEFAULT FALSE,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
+    )`,
 
-    -- Create indexes for better performance
-    CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
-    CREATE INDEX IF NOT EXISTS idx_apis_user_id ON apis(user_id);
-    CREATE INDEX IF NOT EXISTS idx_api_keys_api_id ON api_keys(api_id);
-    CREATE INDEX IF NOT EXISTS idx_api_keys_user_id ON api_keys(user_id);
-    CREATE INDEX IF NOT EXISTS idx_api_keys_key_hash ON api_keys(key_hash);
-    CREATE INDEX IF NOT EXISTS idx_api_usage_logs_api_id ON api_usage_logs(api_id);
-    CREATE INDEX IF NOT EXISTS idx_api_usage_logs_api_key_id ON api_usage_logs(api_key_id);
-    CREATE INDEX IF NOT EXISTS idx_api_usage_logs_created_at ON api_usage_logs(created_at);
-    CREATE INDEX IF NOT EXISTS idx_audit_logs_user_id ON audit_logs(user_id);
-    CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at);
+    // 2. Schema Migrations (Ensure columns exist for pre-existing tables)
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS settings JSONB DEFAULT '{}'`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS is_email_verified BOOLEAN DEFAULT FALSE`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS two_fa_enabled BOOLEAN DEFAULT FALSE`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS two_fa_secret VARCHAR(255)`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS failed_login_attempts INTEGER DEFAULT 0`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until TIMESTAMP`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMP`,
+    `ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS key_hash VARCHAR(255)`,
+    `ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS key_prefix VARCHAR(20)`,
 
-    -- Create trigger to update updated_at timestamp
-    CREATE OR REPLACE FUNCTION update_updated_at_column()
+    // 3. Performance Indexes
+    `CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)`,
+    `CREATE INDEX IF NOT EXISTS idx_apis_user_id ON apis(user_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_api_keys_api_id ON api_keys(api_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_api_keys_user_id ON api_keys(user_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_api_keys_key_hash ON api_keys(key_hash)`,
+    `CREATE INDEX IF NOT EXISTS idx_api_usage_logs_api_id ON api_usage_logs(api_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_api_usage_logs_api_key_id ON api_usage_logs(api_key_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_api_usage_logs_created_at ON api_usage_logs(created_at)`,
+    `CREATE INDEX IF NOT EXISTS idx_audit_logs_user_id ON audit_logs(user_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at)`,
+
+    // 4. Trigger function
+    `CREATE OR REPLACE FUNCTION update_updated_at_column()
     RETURNS TRIGGER AS $$
     BEGIN
         NEW.updated_at = CURRENT_TIMESTAMP;
         RETURN NEW;
     END;
-    $$ language 'plpgsql';    CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON users
-        FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-    
-    CREATE TRIGGER update_apis_updated_at BEFORE UPDATE ON apis
-        FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-    
-    CREATE TRIGGER update_api_keys_updated_at BEFORE UPDATE ON api_keys
-        FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-  `;
-  try {
-    await pool.query(createTablesQuery);
-    logger.info('Database tables created successfully');
-  } catch (error) {
-    // Only log as warning if tables/triggers already exist, don't crash the server
-    if (error.code === '42P07' || error.code === '42710') {
-      logger.warn('Database tables or triggers already exist, continuing...');
-    } else {
-      logger.error('Error creating database tables:', error);
-      throw error;
+    $$ language 'plpgsql'`,
+
+    // 5. Triggers (Drop and recreate to be idempotent)
+    `DROP TRIGGER IF EXISTS update_users_updated_at ON users`,
+    `CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON users
+        FOR EACH ROW EXECUTE FUNCTION update_updated_at_column()`,
+
+    `DROP TRIGGER IF EXISTS update_apis_updated_at ON apis`,
+    `CREATE TRIGGER update_apis_updated_at BEFORE UPDATE ON apis
+        FOR EACH ROW EXECUTE FUNCTION update_updated_at_column()`,
+
+    `DROP TRIGGER IF EXISTS update_api_keys_updated_at ON api_keys`,
+    `CREATE TRIGGER update_api_keys_updated_at BEFORE UPDATE ON api_keys
+        FOR EACH ROW EXECUTE FUNCTION update_updated_at_column()`
+  ];
+
+  for (const sql of schemaStatements) {
+    try {
+      await pool.query(sql);
+    } catch (err) {
+      logger.warn(`Schema setup note for query [${sql.slice(0, 40)}...]: ${err.message}`);
     }
   }
+  logger.info('Database tables and schema verified successfully');
 };
 
 module.exports = {

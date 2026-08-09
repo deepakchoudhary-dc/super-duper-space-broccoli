@@ -84,7 +84,7 @@ const EditAPIKey = () => {
     try {
       setLoading(true);
       const response = await keyAPI.getById(id);
-      const keyData = response.data.data.key;
+      const keyData = response.data?.data?.key || response.data?.data || response.data || {};
       setFormData({
         name: keyData.name || '',
         description: keyData.description || '',
@@ -92,8 +92,8 @@ const EditAPIKey = () => {
         rateLimit: keyData.rateLimit || 1000,
         rateLimitWindow: keyData.rateLimitWindow || 60,
         expiresAt: keyData.expiresAt ? dayjs(keyData.expiresAt) : null,
-        permissions: keyData.permissions || [],
-        allowedIps: keyData.allowedIps || [],
+        permissions: Array.isArray(keyData.permissions) ? keyData.permissions : [],
+        allowedIps: Array.isArray(keyData.allowedIps) ? keyData.allowedIps : [],
         status: keyData.status || 'active',
         webhookUrl: keyData.webhookUrl || ''
       });
@@ -109,9 +109,11 @@ const EditAPIKey = () => {
   const fetchAPIs = async () => {
     try {
       const response = await apiAPI.getAll();
-      setApis(response.data.data.apis || []);
+      const apisList = response.data?.data?.apis || response.data?.apis || (Array.isArray(response.data?.data) ? response.data.data : []);
+      setApis(Array.isArray(apisList) ? apisList : []);
     } catch (error) {
       console.error('Error fetching APIs:', error);
+      setApis([]);
     }
   };
 
@@ -273,7 +275,7 @@ const EditAPIKey = () => {
                         onChange={handleInputChange('apiId')}
                       >
                         <MenuItem value="">All APIs</MenuItem>
-                        {apis.map((api) => (
+                        {(Array.isArray(apis) ? apis : []).map((api) => (
                           <MenuItem key={api.id} value={api.id}>
                             {api.name}
                           </MenuItem>

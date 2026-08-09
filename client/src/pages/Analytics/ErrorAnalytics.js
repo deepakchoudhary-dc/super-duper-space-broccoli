@@ -124,7 +124,17 @@ const ErrorAnalytics = () => {
       };
 
       const response = await api.get('/api/analytics/errors', { params });
-      setErrorData(response.data.data);
+      const data = response.data?.data || response.data;
+      if (data && typeof data === 'object') {
+        setErrorData(prev => ({
+          ...prev,
+          ...data,
+          summary: { ...prev.summary, ...(data.summary || {}) },
+          charts: { ...prev.charts, ...(data.charts || {}) },
+          errorLogs: Array.isArray(data.errorLogs) ? data.errorLogs : prev.errorLogs,
+          topErrors: Array.isArray(data.topErrors) ? data.topErrors : prev.topErrors
+        }));
+      }
     } catch (error) {
       console.error('Failed to fetch error data:', error);
       // Mock data for development
@@ -519,14 +529,14 @@ const ErrorAnalytics = () => {
             <Typography variant="h6" gutterBottom>
               Top Error Patterns
             </Typography>
-            {errorData.topErrors.map((error, index) => (
+            {(Array.isArray(errorData.topErrors) ? errorData.topErrors : []).map((error, index) => (
               <Box key={index} display="flex" alignItems="center" justifyContent="space-between" py={1}>
                 <Box flex={1}>
                   <Typography variant="body2" fontWeight="bold">
                     {error.error}
                   </Typography>
                   <Typography variant="caption" color="textSecondary">
-                    First seen: {error.firstSeen.format('MMM DD, HH:mm')}
+                    First seen: {dayjs(error.firstSeen).format('MMM DD, HH:mm')}
                   </Typography>
                 </Box>
                 <Box display="flex" alignItems="center" gap={1}>
@@ -575,7 +585,7 @@ const ErrorAnalytics = () => {
               </TableRow>
             </TableHead>
             <TableBody>
-              {paginatedErrorLogs.map((log) => (
+              {(Array.isArray(paginatedErrorLogs) ? paginatedErrorLogs : []).map((log) => (
                 <React.Fragment key={log.id}>
                   <TableRow>
                     <TableCell>
@@ -588,7 +598,7 @@ const ErrorAnalytics = () => {
                     </TableCell>
                     <TableCell>
                       <Typography variant="body2">
-                        {log.timestamp.format('MMM DD, HH:mm:ss')}
+                        {dayjs(log.timestamp).format('MMM DD, HH:mm:ss')}
                       </Typography>
                     </TableCell>
                     <TableCell>

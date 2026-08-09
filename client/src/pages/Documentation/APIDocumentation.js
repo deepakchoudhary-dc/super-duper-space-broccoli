@@ -62,10 +62,11 @@ const APIDocumentation = () => {
   const fetchAPIDetails = async () => {
     try {
       setLoading(true);
-      const response = await apiService.get(`/apis/${id}`);
+      const response = await apiService.get(`/api/apis/${id}`);
+      const rawApi = response.data?.data?.api || response.data?.data || response.data || {};
       // Add mock documentation data
       const apiData = {
-        ...response.data,
+        ...rawApi,
         endpoints: [
           {
             id: 1,

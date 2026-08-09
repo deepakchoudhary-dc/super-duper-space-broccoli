@@ -109,9 +109,11 @@ const Analytics = () => {
   const fetchAPIs = async () => {
     try {
       const response = await apiAPI.getAll();
-      setApis(response.data.data || []);
+      const apisList = response.data?.data?.apis || response.data?.apis || (Array.isArray(response.data?.data) ? response.data.data : []);
+      setApis(Array.isArray(apisList) ? apisList : []);
     } catch (error) {
       console.error('Failed to fetch APIs:', error);
+      setApis([]);
     }
   };
 
@@ -125,7 +127,17 @@ const Analytics = () => {
       };
 
       const response = await analyticsAPI.getOverview(params);
-      setAnalyticsData(response.data.data);
+      const data = response.data?.data || response.data;
+      if (data && typeof data === 'object') {
+        setAnalyticsData(prev => ({
+          ...prev,
+          ...data,
+          overview: { ...prev.overview, ...(data.overview || {}) },
+          charts: { ...prev.charts, ...(data.charts || {}) },
+          topConsumers: Array.isArray(data.topConsumers) ? data.topConsumers : prev.topConsumers,
+          recentErrors: Array.isArray(data.recentErrors) ? data.recentErrors : prev.recentErrors
+        }));
+      }
     } catch (error) {
       console.error('Failed to fetch analytics data:', error);
       // Mock data for development
@@ -323,7 +335,7 @@ const Analytics = () => {
                 onChange={(e) => setSelectedAPI(e.target.value)}
               >
                 <MenuItem value="all">All APIs</MenuItem>
-                {apis.map((api) => (
+                {(Array.isArray(apis) ? apis : []).map((api) => (
                   <MenuItem key={api.id} value={api.id}>
                     {api.name}
                   </MenuItem>
@@ -439,7 +451,7 @@ const Analytics = () => {
             <Typography variant="h6" gutterBottom>
               Top API Consumers
             </Typography>
-            {analyticsData.topConsumers.map((consumer, index) => (
+            {(Array.isArray(analyticsData.topConsumers) ? analyticsData.topConsumers : []).map((consumer, index) => (
               <Box key={index} display="flex" alignItems="center" justifyContent="space-between" py={1}>
                 <Typography variant="body2">{consumer.name}</Typography>
                 <Box display="flex" alignItems="center" gap={1}>
@@ -473,7 +485,7 @@ const Analytics = () => {
                   </TableRow>
                 </TableHead>
                 <TableBody>
-                  {analyticsData.recentErrors.map((error, index) => (
+                  {(Array.isArray(analyticsData.recentErrors) ? analyticsData.recentErrors : []).map((error, index) => (
                     <TableRow key={index}>
                       <TableCell>
                         <Typography variant="body2">

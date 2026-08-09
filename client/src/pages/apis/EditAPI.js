@@ -72,23 +72,24 @@ const EditAPI = () => {
   const fetchAPIDetails = async () => {
     try {
       setLoading(true);
-      const response = await apiService.get(`/apis/${id}`);
+      const response = await apiService.get(`/api/apis/${id}`);
+      const apiData = response.data?.data?.api || response.data?.data || response.data || {};
       setFormData({
-        name: response.data.name || '',
-        description: response.data.description || '',
-        endpoint: response.data.endpoint || '',
-        version: response.data.version || '1.0.0',
-        status: response.data.status || 'active',
-        requiresAuth: response.data.requiresAuth ?? true,
-        isPublic: response.data.isPublic ?? false,
-        rateLimit: response.data.rateLimit || 1000,
-        rateLimitWindow: response.data.rateLimitWindow || 60,
-        allowedMethods: response.data.allowedMethods || ['GET'],
-        tags: response.data.tags || [],
-        documentation: response.data.documentation || '',
-        webhookUrl: response.data.webhookUrl || '',
-        retryAttempts: response.data.retryAttempts || 3,
-        timeout: response.data.timeout || 30000
+        name: apiData.name || '',
+        description: apiData.description || '',
+        endpoint: apiData.baseUrl || apiData.endpoint || '',
+        version: apiData.version || '1.0.0',
+        status: apiData.status || 'active',
+        requiresAuth: apiData.requiresAuth ?? true,
+        isPublic: apiData.isPublic ?? false,
+        rateLimit: apiData.rateLimit || 1000,
+        rateLimitWindow: apiData.rateLimitWindow || 60,
+        allowedMethods: apiData.allowedMethods || ['GET'],
+        tags: apiData.tags || [],
+        documentation: apiData.documentationUrl || apiData.documentation || '',
+        webhookUrl: apiData.webhookUrl || '',
+        retryAttempts: apiData.retryAttempts || 3,
+        timeout: apiData.timeout || 30000
       });
     } catch (error) {
       console.error('Error fetching API details:', error);

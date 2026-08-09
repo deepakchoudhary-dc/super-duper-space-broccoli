@@ -1,25 +1,37 @@
 import axios from 'axios';
 import { toast } from 'react-toastify';
 
+const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:5000';
+
 // Create axios instance
 const api = axios.create({
-  baseURL: process.env.REACT_APP_API_URL || 'http://localhost:5000',
-  timeout: 10000,
+  baseURL: API_BASE_URL,
+  timeout: 15000,
   headers: {
     'Content-Type': 'application/json',
   },
 });
 
-// Debug: Log the API URL being used
-console.log('API Base URL:', process.env.REACT_APP_API_URL || 'http://localhost:5000');
-
-// Request interceptor to add auth token
+// Request interceptor to add auth token and normalize URLs
 api.interceptors.request.use(
   (config) => {
+    // Add bearer token
     const token = localStorage.getItem('accessToken');
     if (token) {
       config.headers.Authorization = `Bearer ${token}`;
     }
+
+    // URL normalizer: ensure relative URLs have /api or /proxy prefix
+    if (
+      config.url &&
+      !config.url.startsWith('http://') &&
+      !config.url.startsWith('https://') &&
+      !config.url.startsWith('/api') &&
+      !config.url.startsWith('/proxy')
+    ) {
+      config.url = `/api${config.url.startsWith('/') ? '' : '/'}${config.url}`;
+    }
+
     return config;
   },
   (error) => {
@@ -39,12 +51,15 @@ api.interceptors.response.use(
       try {
         const refreshToken = localStorage.getItem('refreshToken');
         if (refreshToken) {
-          const response = await axios.post('/api/auth/refresh', {
+          const response = await axios.post(`${API_BASE_URL}/api/auth/refresh`, {
             refreshToken
           });
 
-          const { accessToken } = response.data.data.tokens;
+          const { accessToken, refreshToken: newRefreshToken } = response.data.data.tokens;
           localStorage.setItem('accessToken', accessToken);
+          if (newRefreshToken) {
+            localStorage.setItem('refreshToken', newRefreshToken);
+          }
           
           // Retry original request with new token
           originalRequest.headers.Authorization = `Bearer ${accessToken}`;
@@ -61,7 +76,6 @@ api.interceptors.response.use(
 
     // Handle different error types
     if (error.response) {
-      // Server responded with error status
       const { status, data } = error.response;
       
       switch (status) {
@@ -84,11 +98,9 @@ api.interceptors.response.use(
           console.error('Response Error:', data.message);
       }
     } else if (error.request) {
-      // Request was made but no response received
       console.error('Network Error:', error.message);
       toast.error('Network error. Please check your connection.');
     } else {
-      // Something else happened
       console.error('Request Error:', error.message);
     }
 
@@ -96,17 +108,23 @@ api.interceptors.response.use(
   }
 );
 
-// API methods
+// ============================================================================
+// API Service Methods
+// ============================================================================
+
 export const authAPI = {
   login: (credentials) => api.post('/api/auth/login', credentials),
   register: (userData) => api.post('/api/auth/register', userData),
   logout: () => api.post('/api/auth/logout'),
   me: () => api.get('/api/auth/me'),
   verifyEmail: (token, email) => api.post('/api/auth/verify-email', { token, email }),
+  resendVerification: (email) => api.post('/api/auth/resend-verification', { email }),
   setup2FA: () => api.post('/api/auth/setup-2fa'),
   enable2FA: (secret, token) => api.post('/api/auth/enable-2fa', { secret, token }),
   disable2FA: (token) => api.post('/api/auth/disable-2fa', { token }),
   refresh: (refreshToken) => api.post('/api/auth/refresh', { refreshToken }),
+  forgotPassword: (email) => api.post('/api/auth/forgot-password', { email }),
+  resetPassword: (data) => api.post('/api/auth/reset-password', data),
 };
 
 export const userAPI = {
@@ -147,24 +165,27 @@ export const analyticsAPI = {
   getErrors: (params) => api.get('/api/analytics/errors', { params }),
 };
 
+export const settingsAPI = {
+  get: () => api.get('/api/settings'),
+  update: (data) => api.put('/api/settings', data),
+  reset: () => api.post('/api/settings/reset'),
+  deleteAccount: (data) => api.delete('/api/settings/delete-account', { data }),
+};
+
 export const proxyAPI = {
   getStats: (params) => api.get('/proxy/stats', { params }),
   test: () => api.get('/proxy/test'),
   health: () => api.get('/proxy/health'),
 };
 
-// Convenience methods for the Dashboard component
+// Convenience methods
 export const getUserStats = () => userAPI.getStats();
 export const getRecentActivity = () => userAPI.getRecentActivity();
 export const getAlerts = () => userAPI.getAlerts();
-
-// Convenience methods for the APIs component
 export const getApis = () => apiAPI.getAll();
 export const createApi = (data) => apiAPI.create(data);
 export const updateApi = (id, data) => apiAPI.update(id, data);
 export const deleteApi = (id) => apiAPI.delete(id);
-
-// Convenience methods for the API Keys component
 export const getApiKeys = () => keyAPI.getAll();
 export const createApiKey = (data) => keyAPI.create(data);
 export const updateApiKey = (id, data) => keyAPI.update(id, data);

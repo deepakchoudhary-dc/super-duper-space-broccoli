@@ -59,7 +59,7 @@ const Navbar = ({ onDrawerToggle }) => {
     { label: 'APIs', icon: <Api />, path: '/apis' },
     { label: 'API Keys', icon: <VpnKey />, path: '/keys' },
     { label: 'Analytics', icon: <Analytics />, path: '/analytics' },
-    { label: 'Documentation', icon: <Description />, path: '/docs' },
+    { label: 'Documentation', icon: <Description />, path: '/documentation' },
   ];
 
   return (

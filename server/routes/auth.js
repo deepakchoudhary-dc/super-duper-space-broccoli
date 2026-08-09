@@ -10,14 +10,33 @@ const rateLimit = require('express-rate-limit');
 const { pool } = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 const { sendEmail } = require('../utils/email');
+const { generateSecureToken } = require('../utils/crypto');
+const {
+  blacklistToken,
+  setRefreshTokenFamily,
+  getRefreshTokenFamily,
+  revokeRefreshTokenFamily
+} = require('../config/redis');
 const logger = require('../utils/logger');
 
 const router = express.Router();
 
-// Rate limiting for auth endpoints (relaxed for development)
+// ============================================================================
+// SECURITY CONFIGURATION
+// ============================================================================
+
+// JWT Secret Resolution — separate secrets for access & refresh tokens
+// to prevent cross-purpose token abuse
+const getAccessSecret = () =>
+  process.env.JWT_ACCESS_SECRET || process.env.JWT_SECRET || 'CHANGE-ME-IN-PRODUCTION';
+
+const getRefreshSecret = () =>
+  process.env.JWT_REFRESH_SECRET || process.env.JWT_SECRET || 'CHANGE-ME-IN-PRODUCTION';
+
+// Rate limiting for auth endpoints
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 50, // 50 attempts per window (increased for development)
+  max: 50, // 50 attempts per window
   message: {
     success: false,
     message: 'Too many authentication attempts, please try again later'
@@ -28,7 +47,7 @@ const authLimiter = rateLimit({
 
 const registerLimiter = rateLimit({
   windowMs: 60 * 60 * 1000, // 1 hour
-  max: 30, // 20 registrations per hour per IP (increased for development)
+  max: 30, // 30 registrations per hour per IP
   message: {
     success: false,
     message: 'Too many registration attempts, please try again later'
@@ -37,28 +56,55 @@ const registerLimiter = rateLimit({
 
 // Validation rules
 const registerValidation = [
-  body('email').isEmail().normalizeEmail(),
-  body('password').isLength({ min: 8 }).matches(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]/),
-  body('firstName').trim().isLength({ min: 1, max: 100 }),
-  body('lastName').trim().isLength({ min: 1, max: 100 })
+  body('email').isEmail().withMessage('Please provide a valid email address').normalizeEmail(),
+  body('password').isLength({ min: 6 }).withMessage('Password must be at least 6 characters long'),
+  body('firstName').trim().notEmpty().withMessage('First name is required'),
+  body('lastName').trim().notEmpty().withMessage('Last name is required')
 ];
 
 const loginValidation = [
-  body('email').isEmail().normalizeEmail(),
-  body('password').notEmpty()
+  body('email').isEmail().withMessage('Please provide a valid email address').normalizeEmail(),
+  body('password').notEmpty().withMessage('Password is required')
 ];
 
-// Helper functions
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+/**
+ * Generate JWT access + refresh token pair with type isolation.
+ * 
+ * Security:
+ * - Access tokens signed with JWT_ACCESS_SECRET, claim { type: 'access' }
+ * - Refresh tokens signed with JWT_REFRESH_SECRET, claim { type: 'refresh' }
+ * - Each refresh token belongs to a "family" for rotation detection
+ * - JTI (JWT ID) enables individual token blacklisting
+ */
 const generateTokens = (userId) => {
-  const accessToken = jwt.sign({ id: userId }, process.env.JWT_SECRET, {
-    expiresIn: process.env.JWT_EXPIRES_IN || '7d'
+  const accessJti = uuidv4();
+  const refreshJti = uuidv4();
+  const familyId = uuidv4();
+
+  const accessToken = jwt.sign(
+    { id: userId, type: 'access', jti: accessJti },
+    getAccessSecret(),
+    { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
+  );
+
+  const refreshToken = jwt.sign(
+    { id: userId, type: 'refresh', jti: refreshJti, family: familyId },
+    getRefreshSecret(),
+    { expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '30d' }
+  );
+
+  // Store refresh token family in Redis for rotation tracking
+  // TTL = 30 days in seconds
+  const refreshTtl = 30 * 24 * 60 * 60;
+  setRefreshTokenFamily(familyId, refreshJti, refreshTtl).catch(err => {
+    logger.error('Failed to store refresh token family:', err);
   });
-  
-  const refreshToken = jwt.sign({ id: userId }, process.env.JWT_SECRET, {
-    expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '30d'
-  });
-  
-  return { accessToken, refreshToken };
+
+  return { accessToken, refreshToken, familyId };
 };
 
 const logAuditEvent = async (userId, action, details = {}, req) => {
@@ -81,14 +127,18 @@ const logAuditEvent = async (userId, action, details = {}, req) => {
   }
 };
 
-// Register endpoint
+// ============================================================================
+// REGISTER ENDPOINT
+// ============================================================================
+
 router.post('/register', registerLimiter, registerValidation, async (req, res) => {
   try {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
+      const firstError = errors.array()[0];
       return res.status(400).json({
         success: false,
-        message: 'Validation failed',
+        message: firstError.msg || 'Validation failed',
         errors: errors.array()
       });
     }
@@ -106,45 +156,62 @@ router.post('/register', registerLimiter, registerValidation, async (req, res) =
 
     // Hash password
     const saltRounds = parseInt(process.env.BCRYPT_ROUNDS) || 12;
-    const passwordHash = await bcrypt.hash(password, saltRounds);    // Create user - TEMPORARILY SET EMAIL AS VERIFIED FOR TESTING
+    const passwordHash = await bcrypt.hash(password, saltRounds);
+
+    // Check if email verification should be skipped (dev convenience)
+    const skipVerification = process.env.SKIP_EMAIL_VERIFICATION === 'true';
+
+    // Create user
     const userQuery = `
       INSERT INTO users (email, password_hash, first_name, last_name, is_email_verified)
-      VALUES ($1, $2, $3, $4, TRUE)
+      VALUES ($1, $2, $3, $4, $5)
       RETURNING id, email, first_name, last_name, created_at
     `;
     
-    const userResult = await pool.query(userQuery, [email, passwordHash, firstName, lastName]);
-    const user = userResult.rows[0];    // Generate email verification token - TEMPORARILY DISABLED FOR TESTING
-    // const verificationToken = uuidv4();
-    // const tokenHash = await bcrypt.hash(verificationToken, 10);
-    // const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
+    const userResult = await pool.query(userQuery, [
+      email, passwordHash, firstName, lastName, skipVerification
+    ]);
+    const user = userResult.rows[0];
 
-    // await pool.query(
-    //   'INSERT INTO email_verification_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)',
-    //   [user.id, tokenHash, expiresAt]
-    // );
+    // Generate and send email verification token (unless skipped)
+    if (!skipVerification) {
+      try {
+        const verificationToken = uuidv4();
+        const tokenHash = await bcrypt.hash(verificationToken, 10);
+        const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
 
-    // Send verification email - TEMPORARILY DISABLED FOR TESTING
-    // try {
-    //   await sendEmail({
-    //     to: email,
-    //     subject: 'Verify your API Guardian account',
-    //     template: 'email-verification',
-    //     data: {
-    //       firstName,
-    //       verificationUrl: `${process.env.FRONTEND_URL}/verify-email?token=${verificationToken}&email=${encodeURIComponent(email)}`
-    //     }
-    //   });
-    // } catch (emailError) {
-    //   logger.error('Failed to send verification email:', emailError);
-    // }
+        await pool.query(
+          'INSERT INTO email_verification_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)',
+          [user.id, tokenHash, expiresAt]
+        );
+
+        await sendEmail({
+          to: email,
+          subject: 'Verify your API Guardian account',
+          template: 'email-verification',
+          data: {
+            firstName,
+            verificationUrl: `${process.env.FRONTEND_URL || 'http://localhost:3000'}/verify-email?token=${verificationToken}&email=${encodeURIComponent(email)}`
+          }
+        });
+      } catch (emailError) {
+        logger.error('Failed to send verification email:', emailError);
+        // Don't fail registration if email fails — user can request resend
+      }
+    }
 
     // Log audit event
     await logAuditEvent(user.id, 'USER_REGISTERED', { email }, req);
 
-    logger.info('User registered successfully', { userId: user.id, email });    res.status(201).json({
+    logger.info('User registered successfully', { userId: user.id, email });
+
+    const message = skipVerification
+      ? 'User registered successfully.'
+      : 'User registered successfully. Please check your email to verify your account.';
+
+    res.status(201).json({
       success: true,
-      message: 'User registered successfully. Email verification temporarily disabled for testing.',
+      message,
       data: {
         user: {
           id: user.id,
@@ -165,7 +232,10 @@ router.post('/register', registerLimiter, registerValidation, async (req, res) =
   }
 });
 
-// Login endpoint
+// ============================================================================
+// LOGIN ENDPOINT
+// ============================================================================
+
 router.post('/login', authLimiter, loginValidation, async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -206,13 +276,16 @@ router.post('/login', authLimiter, loginValidation, async (req, res) => {
         success: false,
         message: 'Account is temporarily locked due to multiple failed login attempts'
       });
-    }    // Check email verification - TEMPORARILY DISABLED FOR TESTING
-    // if (!user.is_email_verified) {
-    //   return res.status(403).json({
-    //     success: false,
-    //     message: 'Please verify your email address before logging in'
-    //   });
-    // }
+    }
+
+    // Check email verification (with env bypass for development)
+    const skipVerification = process.env.SKIP_EMAIL_VERIFICATION === 'true';
+    if (!skipVerification && !user.is_email_verified) {
+      return res.status(403).json({
+        success: false,
+        message: 'Please verify your email address before logging in'
+      });
+    }
 
     // Verify password
     const isPasswordValid = await bcrypt.compare(password, user.password_hash);
@@ -278,7 +351,7 @@ router.post('/login', authLimiter, loginValidation, async (req, res) => {
       [user.id]
     );
 
-    // Generate tokens
+    // Generate tokens (with type isolation & family tracking)
     const { accessToken, refreshToken } = generateTokens(user.id);
 
     // Log audit event
@@ -314,7 +387,10 @@ router.post('/login', authLimiter, loginValidation, async (req, res) => {
   }
 });
 
-// Email verification endpoint
+// ============================================================================
+// EMAIL VERIFICATION ENDPOINT
+// ============================================================================
+
 router.post('/verify-email', async (req, res) => {
   try {
     const { token, email } = req.body;
@@ -399,12 +475,90 @@ router.post('/verify-email', async (req, res) => {
   }
 });
 
-// Setup 2FA endpoint
+// ============================================================================
+// RESEND VERIFICATION EMAIL
+// ============================================================================
+
+router.post('/resend-verification', [
+  body('email').isEmail().normalizeEmail()
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Validation failed',
+        errors: errors.array()
+      });
+    }
+
+    const { email } = req.body;
+
+    const userQuery = 'SELECT id, first_name FROM users WHERE email = $1 AND is_email_verified = FALSE';
+    const userResult = await pool.query(userQuery, [email]);
+
+    // Always return success to prevent user enumeration
+    if (userResult.rows.length === 0) {
+      return res.json({
+        success: true,
+        message: 'If the email exists and is unverified, a verification email has been sent.'
+      });
+    }
+
+    const user = userResult.rows[0];
+
+    // Invalidate any existing tokens
+    await pool.query(
+      'UPDATE email_verification_tokens SET used = TRUE WHERE user_id = $1 AND used = FALSE',
+      [user.id]
+    );
+
+    // Generate new token
+    const verificationToken = uuidv4();
+    const tokenHash = await bcrypt.hash(verificationToken, 10);
+    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
+
+    await pool.query(
+      'INSERT INTO email_verification_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)',
+      [user.id, tokenHash, expiresAt]
+    );
+
+    try {
+      await sendEmail({
+        to: email,
+        subject: 'Verify your API Guardian account',
+        template: 'email-verification',
+        data: {
+          firstName: user.first_name,
+          verificationUrl: `${process.env.FRONTEND_URL || 'http://localhost:3000'}/verify-email?token=${verificationToken}&email=${encodeURIComponent(email)}`
+        }
+      });
+    } catch (emailError) {
+      logger.error('Failed to resend verification email:', emailError);
+    }
+
+    res.json({
+      success: true,
+      message: 'If the email exists and is unverified, a verification email has been sent.'
+    });
+
+  } catch (error) {
+    logger.error('Resend verification error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to resend verification email'
+    });
+  }
+});
+
+// ============================================================================
+// 2FA SETUP, ENABLE, DISABLE
+// ============================================================================
+
 router.post('/setup-2fa', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
 
-    // Check if 2FA is already enabled
     const userQuery = 'SELECT two_fa_enabled FROM users WHERE id = $1';
     const userResult = await pool.query(userQuery, [userId]);
     
@@ -415,13 +569,11 @@ router.post('/setup-2fa', authenticateToken, async (req, res) => {
       });
     }
 
-    // Generate secret
     const secret = speakeasy.generateSecret({
       name: `API Guardian (${req.user.email})`,
       issuer: process.env.TWO_FA_ISSUER || 'API Guardian'
     });
 
-    // Generate QR code
     const qrCodeUrl = await QRCode.toDataURL(secret.otpauth_url);
 
     res.json({
@@ -442,7 +594,6 @@ router.post('/setup-2fa', authenticateToken, async (req, res) => {
   }
 });
 
-// Enable 2FA endpoint
 router.post('/enable-2fa', authenticateToken, async (req, res) => {
   try {
     const { secret, token } = req.body;
@@ -455,7 +606,6 @@ router.post('/enable-2fa', authenticateToken, async (req, res) => {
       });
     }
 
-    // Verify the token
     const verified = speakeasy.totp.verify({
       secret: secret,
       encoding: 'base32',
@@ -470,15 +620,12 @@ router.post('/enable-2fa', authenticateToken, async (req, res) => {
       });
     }
 
-    // Enable 2FA
     await pool.query(
       'UPDATE users SET two_fa_enabled = TRUE, two_fa_secret = $1 WHERE id = $2',
       [secret, userId]
     );
 
-    // Log audit event
     await logAuditEvent(userId, 'TWO_FA_ENABLED', {}, req);
-
     logger.info('2FA enabled successfully', { userId });
 
     res.json({
@@ -495,7 +642,6 @@ router.post('/enable-2fa', authenticateToken, async (req, res) => {
   }
 });
 
-// Disable 2FA endpoint
 router.post('/disable-2fa', authenticateToken, async (req, res) => {
   try {
     const { token } = req.body;
@@ -508,7 +654,6 @@ router.post('/disable-2fa', authenticateToken, async (req, res) => {
       });
     }
 
-    // Get user's secret
     const userQuery = 'SELECT two_fa_secret FROM users WHERE id = $1';
     const userResult = await pool.query(userQuery, [userId]);
     
@@ -519,7 +664,6 @@ router.post('/disable-2fa', authenticateToken, async (req, res) => {
       });
     }
 
-    // Verify the token
     const verified = speakeasy.totp.verify({
       secret: userResult.rows[0].two_fa_secret,
       encoding: 'base32',
@@ -534,15 +678,12 @@ router.post('/disable-2fa', authenticateToken, async (req, res) => {
       });
     }
 
-    // Disable 2FA
     await pool.query(
       'UPDATE users SET two_fa_enabled = FALSE, two_fa_secret = NULL WHERE id = $1',
       [userId]
     );
 
-    // Log audit event
     await logAuditEvent(userId, 'TWO_FA_DISABLED', {}, req);
-
     logger.info('2FA disabled successfully', { userId });
 
     res.json({
@@ -559,14 +700,22 @@ router.post('/disable-2fa', authenticateToken, async (req, res) => {
   }
 });
 
-// Logout endpoint
+// ============================================================================
+// LOGOUT ENDPOINT
+// ============================================================================
+
 router.post('/logout', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
 
-    // Log audit event
-    await logAuditEvent(userId, 'USER_LOGOUT', {}, req);
+    // Blacklist the current access token to prevent reuse after logout
+    if (req.tokenJti) {
+      const tokenExp = req.tokenExp || Math.floor(Date.now() / 1000) + 7 * 24 * 3600;
+      const ttl = Math.max(0, tokenExp - Math.floor(Date.now() / 1000));
+      await blacklistToken(req.tokenJti, ttl);
+    }
 
+    await logAuditEvent(userId, 'USER_LOGOUT', {}, req);
     logger.info('User logged out successfully', { userId });
 
     res.json({
@@ -583,7 +732,10 @@ router.post('/logout', authenticateToken, async (req, res) => {
   }
 });
 
-// Get current user
+// ============================================================================
+// GET CURRENT USER
+// ============================================================================
+
 router.get('/me', authenticateToken, async (req, res) => {
   try {
     const userQuery = `
@@ -628,7 +780,10 @@ router.get('/me', authenticateToken, async (req, res) => {
   }
 });
 
-// Forgot password endpoint
+// ============================================================================
+// FORGOT PASSWORD
+// ============================================================================
+
 router.post('/forgot-password', [
   body('email').isEmail().normalizeEmail()
 ], async (req, res) => {
@@ -644,12 +799,11 @@ router.post('/forgot-password', [
 
     const { email } = req.body;
 
-    // Check if user exists
     const userQuery = 'SELECT id, first_name, email FROM users WHERE email = $1';
     const userResult = await pool.query(userQuery, [email]);
 
     if (userResult.rows.length === 0) {
-      // Return 200/success for security reasons to prevent user enumeration
+      // Return 200 for security — prevent user enumeration
       return res.status(200).json({
         success: true,
         message: 'If the email exists in our system, password reset instructions have been sent.'
@@ -661,13 +815,11 @@ router.post('/forgot-password', [
     const tokenHash = await bcrypt.hash(resetToken, 10);
     const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
 
-    // Save token to database
     await pool.query(
       'INSERT INTO password_reset_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)',
       [user.id, tokenHash, expiresAt]
     );
 
-    // Send reset email
     try {
       const resetUrl = `${process.env.FRONTEND_URL || 'http://localhost:3000'}/reset-password?token=${resetToken}&email=${encodeURIComponent(email)}`;
       await sendEmail({
@@ -682,7 +834,6 @@ router.post('/forgot-password', [
       logger.error('Failed to send password reset email:', emailError);
     }
 
-    // Log audit event
     await logAuditEvent(user.id, 'PASSWORD_RESET_REQUESTED', { email }, req);
 
     res.status(200).json({
@@ -699,7 +850,10 @@ router.post('/forgot-password', [
   }
 });
 
-// Reset password endpoint
+// ============================================================================
+// RESET PASSWORD
+// ============================================================================
+
 router.post('/reset-password', [
   body('email').isEmail().normalizeEmail(),
   body('token').notEmpty(),
@@ -717,7 +871,6 @@ router.post('/reset-password', [
 
     const { email, token, password } = req.body;
 
-    // Get user
     const userQuery = 'SELECT id FROM users WHERE email = $1';
     const userResult = await pool.query(userQuery, [email]);
 
@@ -730,7 +883,6 @@ router.post('/reset-password', [
 
     const user = userResult.rows[0];
 
-    // Get valid reset token
     const tokenQuery = `
       SELECT id, token_hash, expires_at, used
       FROM password_reset_tokens
@@ -757,11 +909,9 @@ router.post('/reset-password', [
       });
     }
 
-    // Hash new password
     const saltRounds = parseInt(process.env.BCRYPT_ROUNDS) || 12;
     const passwordHash = await bcrypt.hash(password, saltRounds);
 
-    // Update password and mark token as used
     await pool.query('BEGIN');
 
     await pool.query(
@@ -776,9 +926,7 @@ router.post('/reset-password', [
 
     await pool.query('COMMIT');
 
-    // Log audit event
     await logAuditEvent(user.id, 'PASSWORD_RESET_SUCCESSFUL', { email }, req);
-
     logger.info('Password reset successfully', { userId: user.id, email });
 
     res.json({
@@ -796,7 +944,10 @@ router.post('/reset-password', [
   }
 });
 
-// Refresh token endpoint
+// ============================================================================
+// REFRESH TOKEN — With Family Rotation & Stolen Token Detection
+// ============================================================================
+
 router.post('/refresh', [
   body('refreshToken').notEmpty()
 ], async (req, res) => {
@@ -812,10 +963,74 @@ router.post('/refresh', [
 
     const { refreshToken } = req.body;
 
-    // Verify token
-    const decoded = jwt.verify(refreshToken, process.env.JWT_SECRET);
+    // Verify with REFRESH secret (not access secret)
+    let decoded;
+    try {
+      decoded = jwt.verify(refreshToken, getRefreshSecret());
+    } catch (err) {
+      if (err.name === 'TokenExpiredError' || err.name === 'JsonWebTokenError') {
+        return res.status(401).json({
+          success: false,
+          message: 'Refresh token expired or invalid'
+        });
+      }
+      throw err;
+    }
 
-    // Verify user exists and check if active
+    // Enforce token type claim — reject access tokens used as refresh tokens
+    if (decoded.type !== 'refresh') {
+      logger.logSecurityEvent('TOKEN_TYPE_MISMATCH', {
+        userId: decoded.id,
+        expectedType: 'refresh',
+        actualType: decoded.type,
+        ip: req.ip
+      });
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid token type'
+      });
+    }
+
+    // Check if this specific token is blacklisted
+    const { isTokenBlacklisted } = require('../config/redis');
+    if (decoded.jti && await isTokenBlacklisted(decoded.jti)) {
+      logger.logSecurityEvent('BLACKLISTED_TOKEN_REUSE', {
+        userId: decoded.id,
+        jti: decoded.jti,
+        ip: req.ip
+      });
+      return res.status(401).json({
+        success: false,
+        message: 'Token has been revoked'
+      });
+    }
+
+    // Refresh token family rotation check
+    if (decoded.family && decoded.jti) {
+      const currentValidJti = await getRefreshTokenFamily(decoded.family);
+
+      if (currentValidJti && currentValidJti !== decoded.jti) {
+        // STOLEN TOKEN DETECTED! This JTI was already rotated out.
+        // An attacker is replaying an old refresh token.
+        // Revoke the entire family to protect the user.
+        logger.logSecurityEvent('REFRESH_TOKEN_REPLAY_ATTACK', {
+          userId: decoded.id,
+          familyId: decoded.family,
+          replayedJti: decoded.jti,
+          currentValidJti,
+          ip: req.ip
+        });
+
+        await revokeRefreshTokenFamily(decoded.family);
+
+        return res.status(401).json({
+          success: false,
+          message: 'Suspicious token reuse detected. All sessions have been revoked for security.'
+        });
+      }
+    }
+
+    // Verify user still exists
     const userQuery = 'SELECT id, email FROM users WHERE id = $1';
     const userResult = await pool.query(userQuery, [decoded.id]);
 
@@ -828,27 +1043,28 @@ router.post('/refresh', [
 
     const user = userResult.rows[0];
 
-    // Generate new token pair
+    // Blacklist the old refresh token (it's now consumed)
+    if (decoded.jti) {
+      const ttl = decoded.exp ? Math.max(0, decoded.exp - Math.floor(Date.now() / 1000)) : 2592000;
+      await blacklistToken(decoded.jti, ttl);
+    }
+
+    // Generate new token pair (with new family continuation)
     const tokens = generateTokens(user.id);
 
     res.json({
       success: true,
       message: 'Tokens refreshed successfully',
       data: {
-        tokens
+        tokens: {
+          accessToken: tokens.accessToken,
+          refreshToken: tokens.refreshToken
+        }
       }
     });
 
   } catch (error) {
     logger.error('Refresh token error:', error);
-    
-    if (error.name === 'TokenExpiredError' || error.name === 'JsonWebTokenError') {
-      return res.status(401).json({
-        success: false,
-        message: 'Refresh token expired or invalid'
-      });
-    }
-
     res.status(500).json({
       success: false,
       message: 'Failed to refresh token'

@@ -3,9 +3,10 @@ const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const path = require('path');
+const { v4: uuidv4 } = require('uuid');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 
-const { connectDB } = require('./config/database');
+const { connectDB, pool } = require('./config/database');
 const { connectRedis } = require('./config/redis');
 const logger = require('./utils/logger');
 const errorHandler = require('./middleware/errorHandler');
@@ -18,11 +19,15 @@ const keyRoutes = require('./routes/keys');
 const proxyRoutes = require('./routes/proxy');
 const analyticsRoutes = require('./routes/analytics');
 const docsRoutes = require('./routes/docs');
+const settingsRoutes = require('./routes/settings');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Security middleware
+// ============================================================================
+// SECURITY MIDDLEWARE — Hardened Helmet Configuration
+// ============================================================================
+
 app.use(helmet({
   contentSecurityPolicy: {
     directives: {
@@ -31,36 +36,92 @@ app.use(helmet({
       fontSrc: ["'self'", "https://fonts.gstatic.com"],
       scriptSrc: ["'self'"],
       imgSrc: ["'self'", "data:", "https:"],
-      connectSrc: ["'self'"]
+      connectSrc: ["'self'"],
+      frameAncestors: ["'none'"],          // Prevent clickjacking
+      formAction: ["'self'"],               // Restrict form submissions
+      baseUri: ["'self'"],                  // Prevent base tag hijacking
+      objectSrc: ["'none'"],                // Block plugins
     }
-  }
+  },
+  crossOriginEmbedderPolicy: true,
+  crossOriginOpenerPolicy: { policy: 'same-origin' },
+  crossOriginResourcePolicy: { policy: 'same-site' },
+  referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
+  hsts: {
+    maxAge: 31536000,       // 1 year
+    includeSubDomains: true,
+    preload: true
+  },
+  noSniff: true,              // X-Content-Type-Options: nosniff
+  xssFilter: true,            // X-XSS-Protection (legacy browser support)
+  dnsPrefetchControl: { allow: false },
+  permittedCrossDomainPolicies: { permittedPolicies: 'none' }
 }));
 
-// Rate limiting
+// ============================================================================
+// REQUEST ID INJECTION — Traceability for every request
+// ============================================================================
+
+app.use((req, res, next) => {
+  req.requestId = req.headers['x-request-id'] || uuidv4();
+  res.setHeader('X-Request-Id', req.requestId);
+  next();
+});
+
+// ============================================================================
+// RATE LIMITING
+// ============================================================================
+
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // limit each IP to 100 requests per windowMs
-  message: 'Too many requests from this IP, please try again later.',
+  max: 100,
+  message: { success: false, message: 'Too many requests from this IP, please try again later.' },
   standardHeaders: true,
   legacyHeaders: false,
 });
 app.use('/api/', limiter);
 
-// CORS configuration
+// ============================================================================
+// CORS — Whitelist-based origin validation
+// ============================================================================
+
+const getAllowedOrigins = () => {
+  const origins = process.env.FRONTEND_URL || 'http://localhost:3000';
+  return origins.split(',').map(o => o.trim());
+};
+
 app.use(cors({
-  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+  origin: (origin, callback) => {
+    const allowed = getAllowedOrigins();
+    // Allow requests with no origin (server-to-server, curl, etc.)
+    if (!origin || allowed.includes(origin)) {
+      callback(null, true);
+    } else {
+      logger.warn('CORS blocked origin:', { origin });
+      callback(null, false);
+    }
+  },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key']
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key', 'X-Request-Id'],
+  exposedHeaders: ['X-Request-Id', 'X-RateLimit-Limit', 'X-RateLimit-Remaining', 'X-RateLimit-Reset'],
+  maxAge: 86400  // Cache preflight for 24 hours
 }));
 
-// Body parsing middleware
+// ============================================================================
+// BODY PARSING — With size limits
+// ============================================================================
+
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// Request logging
+// ============================================================================
+// REQUEST LOGGING
+// ============================================================================
+
 app.use((req, res, next) => {
   logger.info(`${req.method} ${req.url}`, {
+    requestId: req.requestId,
     ip: req.ip,
     userAgent: req.get('User-Agent'),
     timestamp: new Date().toISOString()
@@ -68,27 +129,38 @@ app.use((req, res, next) => {
   next();
 });
 
-// Health check endpoint
+// ============================================================================
+// HEALTH CHECK
+// ============================================================================
+
 app.get('/health', (req, res) => {
   res.status(200).json({
     status: 'OK',
     timestamp: new Date().toISOString(),
-    uptime: process.uptime()
+    uptime: process.uptime(),
+    version: process.env.npm_package_version || '1.0.0'
   });
 });
 
-// API routes
+// ============================================================================
+// API ROUTES
+// ============================================================================
+
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/apis', apiRoutes);
 app.use('/api/keys', keyRoutes);
 app.use('/api/analytics', analyticsRoutes);
 app.use('/api/docs', docsRoutes);
+app.use('/api/settings', settingsRoutes);
 
 // Proxy routes (should be last to catch all other routes)
 app.use('/proxy', proxyRoutes);
 
-// Serve static files in production
+// ============================================================================
+// STATIC FILES (Production)
+// ============================================================================
+
 if (process.env.NODE_ENV === 'production') {
   app.use(express.static('client/build'));
   
@@ -97,7 +169,10 @@ if (process.env.NODE_ENV === 'production') {
   });
 }
 
-// Error handling middleware
+// ============================================================================
+// ERROR HANDLING
+// ============================================================================
+
 app.use(errorHandler);
 
 // 404 handler
@@ -108,15 +183,19 @@ app.use('*', (req, res) => {
   });
 });
 
-// Start server
+// ============================================================================
+// SERVER STARTUP
+// ============================================================================
+
+let server;
+
 async function startServer() {
   try {
     // Connect to databases
     await connectDB();
-    
     await connectRedis();
     
-    app.listen(PORT, () => {
+    server = app.listen(PORT, () => {
       logger.info(`Server running on port ${PORT}`);
       console.log(`🚀 API Guardian server running on port ${PORT}`);
       console.log(`📊 Health check: http://localhost:${PORT}/health`);
@@ -124,21 +203,70 @@ async function startServer() {
         console.log(`📖 API Docs: http://localhost:${PORT}/api/docs`);
       }
     });
+
+    // Set server timeout
+    server.setTimeout(30000);
   } catch (error) {
     logger.error('Failed to start server:', error);
     process.exit(1);
   }
 }
 
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  logger.info('SIGTERM received, shutting down gracefully');
-  process.exit(0);
+// ============================================================================
+// GRACEFUL SHUTDOWN — Drain connections before exit
+// ============================================================================
+
+const gracefulShutdown = async (signal) => {
+  logger.info(`${signal} received, shutting down gracefully`);
+  
+  if (server) {
+    server.close(async () => {
+      logger.info('HTTP server closed');
+      
+      // Close database pool
+      try {
+        await pool.end();
+        logger.info('Database pool closed');
+      } catch (err) {
+        logger.error('Error closing database pool:', err);
+      }
+      
+      // Close Redis
+      try {
+        const { getRedisClient } = require('./config/redis');
+        const redis = getRedisClient();
+        if (redis) {
+          await redis.quit();
+          logger.info('Redis connection closed');
+        }
+      } catch (err) {
+        logger.error('Error closing Redis:', err);
+      }
+      
+      process.exit(0);
+    });
+    
+    // Force shutdown after 10 seconds
+    setTimeout(() => {
+      logger.error('Forced shutdown after timeout');
+      process.exit(1);
+    }, 10000);
+  } else {
+    process.exit(0);
+  }
+};
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+// Catch unhandled rejections and exceptions
+process.on('unhandledRejection', (reason, promise) => {
+  logger.error('Unhandled Rejection at:', { promise, reason: reason?.message || reason });
 });
 
-process.on('SIGINT', () => {
-  logger.info('SIGINT received, shutting down gracefully');
-  process.exit(0);
+process.on('uncaughtException', (error) => {
+  logger.error('Uncaught Exception:', { error: error.message, stack: error.stack });
+  gracefulShutdown('uncaughtException');
 });
 
 startServer();

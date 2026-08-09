@@ -274,7 +274,7 @@ function App() {
           </ProtectedRoute>
         } />
         
-        <Route path="/analytics/api/:apiId" element={
+        <Route path="/analytics/api/:id" element={
           <ProtectedRoute>
             <Layout>
               <APIAnalytics />
@@ -307,7 +307,7 @@ function App() {
           </ProtectedRoute>
         } />
         
-        <Route path="/documentation/api/:apiId" element={
+        <Route path="/documentation/api/:id" element={
           <ProtectedRoute>
             <Layout>
               <APIDocumentation />

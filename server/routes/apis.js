@@ -10,44 +10,33 @@ const router = express.Router();
 
 // Validation rules
 const createApiValidation = [
-  body('name').trim().isLength({ min: 1, max: 255 }).matches(/^[a-zA-Z0-9\s\-_]+$/),
-  body('description').optional().trim().isLength({ max: 1000 }),
-  body('version').optional().trim().matches(/^\d+\.\d+\.\d+$/),
-  body('documentationUrl').optional().isURL({ protocols: ['http', 'https'], require_protocol: true }),
-  body('documentation').optional().isURL({ protocols: ['http', 'https'], require_protocol: true }),
-  body('webhookUrl').optional().isURL({ protocols: ['http', 'https'], require_protocol: true }),
+  body('name').trim().notEmpty().withMessage('API name is required').isLength({ min: 1, max: 255 }).withMessage('API name must be between 1 and 255 characters'),
+  body('description').optional({ checkFalsy: true }).trim().isLength({ max: 1000 }).withMessage('Description must be under 1000 characters'),
+  body('version').optional({ checkFalsy: true }).trim(),
+  body('documentationUrl').optional({ checkFalsy: true }).trim(),
+  body('documentation').optional({ checkFalsy: true }).trim(),
+  body('webhookUrl').optional({ checkFalsy: true }).trim(),
   body().custom((value, { req }) => {
     const url = req.body.baseUrl || req.body.endpoint;
-    if (!url) {
-      throw new Error('API Endpoint/Base URL is required');
+    if (!url || !url.trim()) {
+      throw new Error('Base URL is required');
     }
-    // simple URL check
-    try {
-      new URL(url);
-      return true;
-    } catch (e) {
-      throw new Error('API Endpoint/Base URL must be a valid URL');
-    }
+    return true;
   })
 ];
 
 const updateApiValidation = [
-  body('name').optional().trim().isLength({ min: 1, max: 255 }).matches(/^[a-zA-Z0-9\s\-_]+$/),
-  body('description').optional().trim().isLength({ max: 1000 }),
-  body('version').optional().trim().matches(/^\d+\.\d+\.\d+$/),
-  body('documentationUrl').optional().isURL({ protocols: ['http', 'https'], require_protocol: true }),
-  body('documentation').optional().isURL({ protocols: ['http', 'https'], require_protocol: true }),
-  body('webhookUrl').optional().isURL({ protocols: ['http', 'https'], require_protocol: true }),
+  body('name').optional().trim().notEmpty().withMessage('API name cannot be empty').isLength({ min: 1, max: 255 }),
+  body('description').optional({ checkFalsy: true }).trim().isLength({ max: 1000 }),
+  body('version').optional({ checkFalsy: true }).trim(),
+  body('documentationUrl').optional({ checkFalsy: true }).trim(),
+  body('documentation').optional({ checkFalsy: true }).trim(),
+  body('webhookUrl').optional({ checkFalsy: true }).trim(),
   body('status').optional().isIn(['active', 'inactive', 'maintenance']),
   body().custom((value, { req }) => {
     const url = req.body.baseUrl || req.body.endpoint;
-    if (url) {
-      try {
-        new URL(url);
-        return true;
-      } catch (e) {
-        throw new Error('API Endpoint/Base URL must be a valid URL');
-      }
+    if (url !== undefined && !url.trim()) {
+      throw new Error('Base URL cannot be empty');
     }
     return true;
   })
@@ -229,9 +218,10 @@ router.post('/', authenticateToken, createApiValidation, async (req, res) => {
   try {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
+      const firstError = errors.array()[0];
       return res.status(400).json({
         success: false,
-        message: 'Validation failed',
+        message: firstError.msg || 'Validation failed',
         errors: errors.array()
       });
     }
@@ -359,9 +349,10 @@ router.put('/:id', authenticateToken, checkResourceOwnership('api'), updateApiVa
   try {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
+      const firstError = errors.array()[0];
       return res.status(400).json({
         success: false,
-        message: 'Validation failed',
+        message: firstError.msg || 'Validation failed',
         errors: errors.array()
       });
     }

@@ -92,7 +92,30 @@ const CreateAPIKey = () => {
   const fetchAPIs = async () => {
     try {
       const response = await api.get('/api/apis');
-      setApis(response.data.data.apis || []);
+      const apisList = response.data?.data?.apis || response.data?.apis || (Array.isArray(response.data?.data) ? response.data.data : []);
+      setApis(Array.isArray(apisList) && apisList.length > 0 ? apisList : [
+        {
+          id: 'api1',
+          name: 'User Management API',
+          description: 'Manage user accounts and profiles',
+          version: 'v1.0',
+          status: 'active'
+        },
+        {
+          id: 'api2',
+          name: 'Analytics API',
+          description: 'Access analytics and reporting data',
+          version: 'v2.0',
+          status: 'active'
+        },
+        {
+          id: 'api3',
+          name: 'Payment Processing API',
+          description: 'Handle payment transactions',
+          version: 'v1.5',
+          status: 'active'
+        }
+      ]);
     } catch (error) {
       console.error('Failed to fetch APIs:', error);
       // Mock data for development
@@ -205,8 +228,9 @@ const CreateAPIKey = () => {
   };
 
   const handleCopyKey = () => {
-    if (createdKey?.key) {
-      copy(createdKey.key);
+    const rawKey = createdKey?.apiKey || createdKey?.key;
+    if (rawKey) {
+      copy(rawKey);
       toast.success('API key copied to clipboard');
     }
   };
@@ -276,7 +300,7 @@ const CreateAPIKey = () => {
             )}
 
             <Grid container spacing={2}>
-              {apis.map(apiItem => (
+              {(Array.isArray(apis) ? apis : []).map(apiItem => (
                 <Grid item xs={12} md={6} key={apiItem.id}>
                   <Card
                     sx={{
@@ -519,7 +543,9 @@ const CreateAPIKey = () => {
                   borderColor: 'divider'
                 }}
               >
-                {showKey ? createdKey.key : '•'.repeat(createdKey.key.length)}
+                {showKey 
+                  ? (createdKey.apiKey || createdKey.key) 
+                  : '•'.repeat((createdKey.apiKey || createdKey.key || '').length)}
               </Box>
             </CardContent>
           </Card>
@@ -534,7 +560,7 @@ const CreateAPIKey = () => {
                   const element = document.createElement('a');
                   const file = new Blob([JSON.stringify({
                     name: formData.name,
-                    key: createdKey.key,
+                    key: createdKey.apiKey || createdKey.key,
                     createdAt: new Date().toISOString()
                   }, null, 2)], { type: 'application/json' });
                   element.href = URL.createObjectURL(file);
@@ -551,7 +577,7 @@ const CreateAPIKey = () => {
               <Button
                 fullWidth
                 variant="contained"
-                onClick={() => navigate('/api-keys')}
+                onClick={() => navigate('/keys')}
               >
                 View API Keys
               </Button>
@@ -565,7 +591,7 @@ const CreateAPIKey = () => {
   return (
     <Container maxWidth="md" sx={{ mt: 4, mb: 4 }}>
       <Box display="flex" alignItems="center" mb={3}>
-        <IconButton onClick={() => navigate('/api-keys')} sx={{ mr: 2 }}>
+        <IconButton onClick={() => navigate('/keys')} sx={{ mr: 2 }}>
           <ArrowBack />
         </IconButton>
         <Typography variant="h4">

@@ -1,6 +1,8 @@
 const express = require('express');
-const { createProxyMiddleware } = require('http-proxy-middleware');
-const axios = require('axios');
+const http = require('http');
+const https = require('https');
+const { URL } = require('url');
+const { v4: uuidv4 } = require('uuid');
 
 const { pool } = require('../config/database');
 const { 
@@ -13,25 +15,71 @@ const logger = require('../utils/logger');
 
 const router = express.Router();
 
-// Middleware to log API usage
-const logApiUsage = async (req, res, next) => {
+// ============================================================================
+// PERSISTENT CONNECTION POOL (Fixes per-request proxy instantiation leak)
+// ============================================================================
+
+/**
+ * Singleton HTTP/HTTPS agent pool keyed by upstream base_url.
+ * Reuses TCP connections across requests via Keep-Alive, eliminating
+ * the socket churn and memory leak from creating proxies per-request.
+ */
+const agentPool = new Map();
+
+const getAgent = (baseUrl) => {
+  if (agentPool.has(baseUrl)) {
+    return agentPool.get(baseUrl);
+  }
+
+  const url = new URL(baseUrl);
+  const AgentClass = url.protocol === 'https:' ? https.Agent : http.Agent;
+
+  const agent = new AgentClass({
+    keepAlive: true,
+    keepAliveMsecs: 30000,
+    maxSockets: 50,
+    maxFreeSockets: 10,
+    timeout: 30000
+  });
+
+  agentPool.set(baseUrl, agent);
+  return agent;
+};
+
+// Clean up agents on process exit
+process.on('SIGTERM', () => {
+  agentPool.forEach((agent) => agent.destroy());
+  agentPool.clear();
+});
+
+process.on('SIGINT', () => {
+  agentPool.forEach((agent) => agent.destroy());
+  agentPool.clear();
+});
+
+// ============================================================================
+// USAGE LOGGING MIDDLEWARE (Fixed: no res.end monkeypatching)
+// ============================================================================
+
+/**
+ * Non-blocking API usage logger using res.on('finish') instead of
+ * monkeypatching res.end(). This avoids:
+ * - Memory exhaustion from buffering response bodies
+ * - Broken streaming for chunked/SSE responses
+ * - Event listener leaks
+ */
+const logApiUsage = (req, res, next) => {
   const startTime = Date.now();
   
-  // Store original res.end to intercept response
-  const originalEnd = res.end;
-  let responseBody = '';
-  
-  res.end = function(chunk, encoding) {
-    if (chunk) {
-      responseBody += chunk.toString();
-    }
+  // Attach request ID for traceability
+  req.requestId = req.headers['x-request-id'] || uuidv4();
+  res.setHeader('X-Request-Id', req.requestId);
+
+  res.on('finish', () => {
+    const responseTime = Date.now() - startTime;
     
-    // Log the API usage
-    const endTime = Date.now();
-    const responseTime = endTime - startTime;
-    
-    // Log to database
-    const logUsage = async () => {
+    // Fire-and-forget async logging — never blocks the response
+    (async () => {
       try {
         if (req.apiKey) {
           const usageQuery = `
@@ -42,9 +90,10 @@ const logApiUsage = async (req, res, next) => {
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
           `;
           
-          const requestSize = req.get('content-length') || 0;
-          const responseSize = Buffer.byteLength(responseBody);
-          const errorMessage = res.statusCode >= 400 ? responseBody : null;
+          const requestSize = parseInt(req.get('content-length')) || 0;
+          // Get response size from header (no body buffering)
+          const responseSize = parseInt(res.getHeader('content-length')) || 0;
+          const errorMessage = res.statusCode >= 400 ? `HTTP ${res.statusCode}` : null;
           
           await pool.query(usageQuery, [
             req.apiKey.api_id,
@@ -54,7 +103,7 @@ const logApiUsage = async (req, res, next) => {
             req.path,
             res.statusCode,
             responseTime,
-            parseInt(requestSize),
+            requestSize,
             responseSize,
             req.ip,
             req.get('User-Agent'),
@@ -62,7 +111,11 @@ const logApiUsage = async (req, res, next) => {
           ]);
           
           // Update Redis usage stats
-          await incrementUsage(req.apiKey.id, req.path);
+          try {
+            await incrementUsage(req.apiKey.id, req.path);
+          } catch (redisErr) {
+            // Non-critical — Redis may be unavailable
+          }
           
           // Update last_used timestamp
           await pool.query(
@@ -71,8 +124,9 @@ const logApiUsage = async (req, res, next) => {
           );
         }
         
-        // Log to file
+        // Structured log entry
         logger.logApiUsage({
+          requestId: req.requestId,
           apiId: req.apiKey?.api_id,
           keyId: req.apiKey?.id,
           userId: req.user?.id,
@@ -87,18 +141,16 @@ const logApiUsage = async (req, res, next) => {
       } catch (error) {
         logger.error('Failed to log API usage:', error);
       }
-    };
-    
-    logUsage();
-    
-    // Call original end method
-    originalEnd.call(this, chunk, encoding);
-  };
+    })();
+  });
   
   next();
 };
 
-// Middleware to validate API endpoint permissions
+// ============================================================================
+// ENDPOINT PERMISSION VALIDATION
+// ============================================================================
+
 const validateEndpointPermissions = (req, res, next) => {
   try {
     const { apiKey } = req;
@@ -114,17 +166,14 @@ const validateEndpointPermissions = (req, res, next) => {
     const method = req.method.toLowerCase();
     const path = req.path;
     
-    // Check if the endpoint is allowed
     let allowed = false;
     
     if (permissions.endpoints) {
       for (const endpoint of permissions.endpoints) {
-        // Simple path matching (can be enhanced with regex or glob patterns)
         const endpointPath = endpoint.path.replace(/\*/g, '.*');
         const pathRegex = new RegExp(`^${endpointPath}$`);
         
         if (pathRegex.test(path) || endpoint.path === '*') {
-          // Check method permissions
           if (endpoint.methods.includes(method) || endpoint.methods.includes('*')) {
             allowed = true;
             break;
@@ -151,13 +200,132 @@ const validateEndpointPermissions = (req, res, next) => {
   }
 };
 
-// Proxy endpoint: /proxy/:userId/:apiId/*
+// ============================================================================
+// STREAMING REVERSE PROXY (Zero-copy, persistent connections)
+// ============================================================================
+
+/**
+ * Forward request to upstream using persistent HTTP agents and stream.pipeline.
+ * No response body buffering — streams directly between client and upstream.
+ */
+const proxyRequest = (req, res, targetUrl, baseUrl) => {
+  const url = new URL(targetUrl);
+  const agent = getAgent(baseUrl);
+  const httpModule = url.protocol === 'https:' ? https : http;
+
+  // Build upstream request options
+  const options = {
+    hostname: url.hostname,
+    port: url.port || (url.protocol === 'https:' ? 443 : 80),
+    path: url.pathname + url.search,
+    method: req.method,
+    agent: agent,
+    headers: {
+      ...req.headers,
+      host: url.hostname,
+      'x-api-guardian-key': req.apiKey.id,
+      'x-api-guardian-user': req.user.id,
+      'x-forwarded-for': req.ip,
+      'x-real-ip': req.ip,
+      'x-request-id': req.requestId || uuidv4()
+    },
+    timeout: 30000
+  };
+
+  // Remove hop-by-hop headers that shouldn't be forwarded
+  delete options.headers['connection'];
+  delete options.headers['keep-alive'];
+  delete options.headers['transfer-encoding'];
+
+  logger.debug('Proxying request', {
+    requestId: req.requestId,
+    originalUrl: req.originalUrl,
+    targetUrl: targetUrl,
+    method: req.method
+  });
+
+  const proxyReq = httpModule.request(options, (proxyRes) => {
+    // Set response headers from upstream
+    const responseHeaders = { ...proxyRes.headers };
+    
+    // Add CORS headers
+    responseHeaders['access-control-allow-origin'] = '*';
+    responseHeaders['access-control-allow-methods'] = 'GET, POST, PUT, DELETE, PATCH, OPTIONS';
+    responseHeaders['access-control-allow-headers'] = 'Content-Type, Authorization, X-API-Key';
+    
+    // Add API Guardian metadata headers
+    responseHeaders['x-api-guardian-key-id'] = req.apiKey.id;
+    responseHeaders['x-api-guardian-rate-limit'] = String(req.apiKey.rate_limit);
+    responseHeaders['x-api-guardian-rate-window'] = String(req.apiKey.rate_limit_window);
+    responseHeaders['x-request-id'] = req.requestId;
+
+    // Remove hop-by-hop headers from response
+    delete responseHeaders['connection'];
+    delete responseHeaders['keep-alive'];
+    delete responseHeaders['transfer-encoding'];
+
+    res.writeHead(proxyRes.statusCode, responseHeaders);
+
+    // Stream response body directly — zero memory buffering
+    proxyRes.pipe(res);
+
+    proxyRes.on('error', (err) => {
+      logger.error('Proxy response stream error:', { error: err.message, requestId: req.requestId });
+      if (!res.headersSent) {
+        res.status(502).json({
+          success: false,
+          message: 'Bad Gateway - Upstream response error'
+        });
+      }
+    });
+
+    logger.debug('Proxy response', {
+      requestId: req.requestId,
+      statusCode: proxyRes.statusCode
+    });
+  });
+
+  proxyReq.on('error', (err) => {
+    logger.error('Proxy request error:', {
+      error: err.message,
+      url: targetUrl,
+      target: baseUrl,
+      requestId: req.requestId
+    });
+    
+    if (!res.headersSent) {
+      res.status(502).json({
+        success: false,
+        message: 'Bad Gateway - Unable to reach target API',
+        error: process.env.NODE_ENV === 'development' ? err.message : undefined
+      });
+    }
+  });
+
+  proxyReq.on('timeout', () => {
+    proxyReq.destroy();
+    if (!res.headersSent) {
+      res.status(504).json({
+        success: false,
+        message: 'Gateway Timeout - Target API did not respond in time'
+      });
+    }
+  });
+
+  // Stream request body to upstream — zero-copy
+  req.pipe(proxyReq);
+};
+
+// ============================================================================
+// PROXY ROUTE: /proxy/:userId/:apiId/*
+// ============================================================================
+
 router.use('/:userId/:apiId/*', 
   authenticateApiKey,
   rateLimitMiddleware,
   validateEndpointPermissions,
   logApiUsage,
-  (req, res, next) => {
+  (req, res) => {
     const { userId, apiId } = req.params;
     const targetPath = req.params[0] || '';
     
@@ -177,80 +345,38 @@ router.use('/:userId/:apiId/*',
       });
     }
     
-    // Create proxy middleware
-    const proxyMiddleware = createProxyMiddleware({
-      target: req.apiKey.base_url,
-      changeOrigin: true,
-      pathRewrite: {
-        [`^/proxy/${userId}/${apiId}/`]: '/'
-      },
-      onProxyReq: (proxyReq, req, res) => {
-        // Add custom headers if needed
-        proxyReq.setHeader('X-API-Guardian-Key', req.apiKey.id);
-        proxyReq.setHeader('X-API-Guardian-User', req.user.id);
-        
-        // Add original IP
-        proxyReq.setHeader('X-Forwarded-For', req.ip);
-        proxyReq.setHeader('X-Real-IP', req.ip);
-        
-        logger.debug('Proxying request', {
-          originalUrl: req.originalUrl,
-          targetUrl: `${req.apiKey.base_url}/${targetPath}`,
-          method: req.method,
-          headers: req.headers
-        });
-      },
-      onProxyRes: (proxyRes, req, res) => {
-        // Add CORS headers
-        proxyRes.headers['Access-Control-Allow-Origin'] = '*';
-        proxyRes.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, PATCH, OPTIONS';
-        proxyRes.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-API-Key';
-        
-        // Add API Guardian headers
-        proxyRes.headers['X-API-Guardian-Key-ID'] = req.apiKey.id;
-        proxyRes.headers['X-API-Guardian-Rate-Limit'] = req.apiKey.rate_limit;
-        proxyRes.headers['X-API-Guardian-Rate-Window'] = req.apiKey.rate_limit_window;
-        
-        logger.debug('Proxy response', {
-          statusCode: proxyRes.statusCode,
-          headers: proxyRes.headers
-        });
-      },
-      onError: (err, req, res) => {
-        logger.error('Proxy error:', {
-          error: err.message,
-          url: req.url,
-          target: req.apiKey?.base_url
-        });
-        
-        res.status(502).json({
-          success: false,
-          message: 'Bad Gateway - Unable to reach target API',
-          error: process.env.NODE_ENV === 'development' ? err.message : undefined
-        });
-      }
-    });
+    // Build target URL
+    const baseUrl = req.apiKey.base_url.replace(/\/+$/, ''); // Strip trailing slashes
+    const targetUrl = `${baseUrl}/${targetPath}${req.url.includes('?') ? '?' + req.url.split('?')[1] : ''}`;
     
-    proxyMiddleware(req, res, next);
+    // Stream proxy request using persistent agent
+    proxyRequest(req, res, targetUrl, baseUrl);
   }
 );
 
-// Health check endpoint for proxy
+// ============================================================================
+// UTILITY ENDPOINTS
+// ============================================================================
+
+// Health check
 router.get('/health', (req, res) => {
   res.json({
     success: true,
     message: 'API Gateway is healthy',
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    activeConnections: agentPool.size
   });
 });
 
-// Get proxy statistics
+// Proxy statistics
 router.get('/stats', authenticateApiKey, async (req, res) => {
   try {
     const { apiKey } = req;
     const { days = 7 } = req.query;
+
+    // Sanitize days parameter
+    const safeDays = Math.max(1, Math.min(365, parseInt(days) || 7));
     
-    // Get usage statistics for this API key
     const statsQuery = `
       SELECT 
         COUNT(*) as total_requests,
@@ -260,13 +386,12 @@ router.get('/stats', authenticateApiKey, async (req, res) => {
         MIN(created_at) as first_request,
         MAX(created_at) as last_request
       FROM api_usage_logs 
-      WHERE api_key_id = $1 AND created_at >= CURRENT_TIMESTAMP - INTERVAL '${parseInt(days)} days'
+      WHERE api_key_id = $1 AND created_at >= CURRENT_TIMESTAMP - MAKE_INTERVAL(days => $2)
     `;
     
-    const statsResult = await pool.query(statsQuery, [apiKey.id]);
+    const statsResult = await pool.query(statsQuery, [apiKey.id, safeDays]);
     const stats = statsResult.rows[0];
     
-    // Get hourly usage for the last 24 hours
     const hourlyQuery = `
       SELECT 
         DATE_TRUNC('hour', created_at) as hour,
@@ -332,7 +457,7 @@ router.get('/test', authenticateApiKey, (req, res) => {
   });
 });
 
-// Handle preflight requests for CORS
+// CORS preflight
 router.options('*', (req, res) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');

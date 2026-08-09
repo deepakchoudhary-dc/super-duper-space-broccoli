@@ -74,7 +74,7 @@ const APIKeyDetails = () => {
     try {
       setLoading(true);
       const response = await keyAPI.getById(id);
-      setApiKey(response.data.data.key);
+      setApiKey(response.data?.data?.key || response.data?.data || response.data);
     } catch (error) {
       console.error('Error fetching API key details:', error);
       toast.error('Failed to load API key details');
@@ -87,7 +87,7 @@ const APIKeyDetails = () => {
   const fetchAnalytics = async () => {
     try {
       const response = await analyticsAPI.getKeyAnalytics(id);
-      setAnalytics(response.data.data.overview || {});
+      setAnalytics(response.data?.data?.overview || response.data?.data || {});
     } catch (error) {
       console.error('Error fetching analytics:', error);
     }
@@ -96,9 +96,11 @@ const APIKeyDetails = () => {
   const fetchUsageLogs = async () => {
     try {
       const response = await keyAPI.getUsage(id);
-      setUsageLogs(response.data.data.usage || []);
+      const usage = response.data?.data?.usage || response.data?.data || [];
+      setUsageLogs(Array.isArray(usage) ? usage : []);
     } catch (error) {
       console.error('Error fetching usage logs:', error);
+      setUsageLogs([]);
     }
   };
 

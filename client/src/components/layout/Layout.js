@@ -4,7 +4,7 @@ import { Outlet } from 'react-router-dom';
 import Navbar from './Navbar';
 import Sidebar from './Sidebar';
 
-const Layout = () => {
+const Layout = ({ children }) => {
   const [mobileOpen, setMobileOpen] = useState(false);
 
   const handleDrawerToggle = () => {
@@ -27,7 +27,7 @@ const Layout = () => {
         }}
       >
         <Toolbar />
-        <Outlet />
+        {children || <Outlet />}
       </Box>
     </Box>
   );

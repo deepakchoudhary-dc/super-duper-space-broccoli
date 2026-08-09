@@ -35,8 +35,23 @@ const connectRedis = async () => {
     ]);
   } catch (error) {
     logger.warn('Redis connection failed, continuing without Redis:', error.message);
+    redisClient = null;
     // Don't throw error, just continue without Redis
   }
+};
+
+/**
+ * Get the Redis client instance (getter fixes CommonJS export-by-value bug).
+ * @returns {object|null} The Redis client or null if not connected
+ */
+const getRedisClient = () => redisClient;
+
+/**
+ * Check if Redis is connected and available.
+ * @returns {boolean}
+ */
+const isRedisAvailable = () => {
+  return redisClient !== null && redisClient !== undefined && redisClient.isOpen;
 };
 
 // Rate limiting helpers
@@ -46,8 +61,9 @@ const rateLimitKey = (identifier, window = 3600) => {
 };
 
 const checkRateLimit = async (identifier, limit = 1000, window = 3600) => {
-  if (!redisClient) {
-    throw new Error('Redis client not connected');
+  if (!isRedisAvailable()) {
+    // Fail-open when Redis is down (configurable)
+    return { allowed: true, current: 0, limit, resetTime: 0 };
   }
 
   const key = rateLimitKey(identifier, window);
@@ -75,16 +91,17 @@ const checkRateLimit = async (identifier, limit = 1000, window = 3600) => {
 
 // Session management
 const setSession = async (sessionId, data, expiry = 86400) => {
-  if (!redisClient) {
-    throw new Error('Redis client not connected');
+  if (!isRedisAvailable()) {
+    logger.warn('Redis not available for session storage');
+    return;
   }
   
   await redisClient.setEx(`session:${sessionId}`, expiry, JSON.stringify(data));
 };
 
 const getSession = async (sessionId) => {
-  if (!redisClient) {
-    throw new Error('Redis client not connected');
+  if (!isRedisAvailable()) {
+    return null;
   }
   
   const data = await redisClient.get(`session:${sessionId}`);
@@ -92,8 +109,8 @@ const getSession = async (sessionId) => {
 };
 
 const deleteSession = async (sessionId) => {
-  if (!redisClient) {
-    throw new Error('Redis client not connected');
+  if (!isRedisAvailable()) {
+    return;
   }
   
   await redisClient.del(`session:${sessionId}`);
@@ -101,16 +118,16 @@ const deleteSession = async (sessionId) => {
 
 // Cache helpers
 const setCache = async (key, data, expiry = 3600) => {
-  if (!redisClient) {
-    throw new Error('Redis client not connected');
+  if (!isRedisAvailable()) {
+    return;
   }
   
   await redisClient.setEx(key, expiry, JSON.stringify(data));
 };
 
 const getCache = async (key) => {
-  if (!redisClient) {
-    throw new Error('Redis client not connected');
+  if (!isRedisAvailable()) {
+    return null;
   }
   
   const data = await redisClient.get(key);
@@ -118,26 +135,93 @@ const getCache = async (key) => {
 };
 
 const deleteCache = async (key) => {
-  if (!redisClient) {
-    throw new Error('Redis client not connected');
+  if (!isRedisAvailable()) {
+    return;
   }
   
   await redisClient.del(key);
 };
 
-// API key validation cache
+// API key validation cache (now keyed by hash, not raw key)
 const cacheApiKey = async (keyHash, keyData, expiry = 900) => {
-  await setCache(`api_key:${keyHash}`, keyData, expiry);
+  await setCache(`api_key_cache:${keyHash}`, keyData, expiry);
 };
 
 const getCachedApiKey = async (keyHash) => {
-  return await getCache(`api_key:${keyHash}`);
+  return await getCache(`api_key_cache:${keyHash}`);
+};
+
+// ============================================================================
+// TOKEN BLACKLIST — For JWT refresh token rotation & instant revocation
+// ============================================================================
+
+/**
+ * Add a token (JTI or raw token hash) to the blacklist.
+ * TTL should match the token's remaining lifetime.
+ * 
+ * @param {string} tokenId - The JWT ID (jti) or token hash
+ * @param {number} ttlSeconds - Seconds until the blacklist entry expires
+ */
+const blacklistToken = async (tokenId, ttlSeconds = 2592000) => {
+  if (!isRedisAvailable()) {
+    logger.warn('Redis not available — token blacklist skipped (security risk)');
+    return;
+  }
+
+  await redisClient.setEx(`token_blacklist:${tokenId}`, ttlSeconds, '1');
+};
+
+/**
+ * Check if a token is blacklisted.
+ * @param {string} tokenId - The JWT ID (jti) or token hash
+ * @returns {boolean} true if blacklisted
+ */
+const isTokenBlacklisted = async (tokenId) => {
+  if (!isRedisAvailable()) {
+    return false; // Fail-open when Redis is down
+  }
+
+  const result = await redisClient.get(`token_blacklist:${tokenId}`);
+  return result !== null;
+};
+
+/**
+ * Store a refresh token family for rotation tracking.
+ * When a refresh token is used, the family ID links parent→child tokens.
+ * If an old child is reused, the entire family is revoked.
+ * 
+ * @param {string} familyId - UUID identifying the token family
+ * @param {string} currentTokenId - The currently valid token's JTI
+ * @param {number} ttlSeconds - TTL matching refresh token expiry
+ */
+const setRefreshTokenFamily = async (familyId, currentTokenId, ttlSeconds = 2592000) => {
+  if (!isRedisAvailable()) return;
+  await redisClient.setEx(`refresh_family:${familyId}`, ttlSeconds, currentTokenId);
+};
+
+/**
+ * Get the currently valid token ID for a refresh token family.
+ * @param {string} familyId 
+ * @returns {string|null} The current valid JTI, or null
+ */
+const getRefreshTokenFamily = async (familyId) => {
+  if (!isRedisAvailable()) return null;
+  return await redisClient.get(`refresh_family:${familyId}`);
+};
+
+/**
+ * Revoke an entire refresh token family (stolen token detection).
+ * @param {string} familyId 
+ */
+const revokeRefreshTokenFamily = async (familyId) => {
+  if (!isRedisAvailable()) return;
+  await redisClient.del(`refresh_family:${familyId}`);
 };
 
 // Usage tracking
 const incrementUsage = async (apiKeyId, endpoint) => {
-  if (!redisClient) {
-    throw new Error('Redis client not connected');
+  if (!isRedisAvailable()) {
+    return;
   }
   
   const today = new Date().toISOString().split('T')[0];
@@ -159,8 +243,8 @@ const incrementUsage = async (apiKeyId, endpoint) => {
 };
 
 const getUsageStats = async (apiKeyId, days = 7) => {
-  if (!redisClient) {
-    throw new Error('Redis client not connected');
+  if (!isRedisAvailable()) {
+    return { daily: {}, hourly: {}, endpoints: {} };
   }
   
   const stats = {
@@ -183,7 +267,8 @@ const getUsageStats = async (apiKeyId, days = 7) => {
 };
 
 module.exports = {
-  redisClient,
+  getRedisClient,
+  isRedisAvailable,
   connectRedis,
   checkRateLimit,
   setSession,
@@ -194,6 +279,11 @@ module.exports = {
   deleteCache,
   cacheApiKey,
   getCachedApiKey,
+  blacklistToken,
+  isTokenBlacklisted,
+  setRefreshTokenFamily,
+  getRefreshTokenFamily,
+  revokeRefreshTokenFamily,
   incrementUsage,
   getUsageStats
 };

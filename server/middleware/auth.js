@@ -1,9 +1,29 @@
 const jwt = require('jsonwebtoken');
 const { pool } = require('../config/database');
-const { getCachedApiKey } = require('../config/redis');
+const { getCachedApiKey, cacheApiKey, isTokenBlacklisted } = require('../config/redis');
+const { hashApiKey, isValidKeyFormat, extractKeyPrefix, verifyApiKey } = require('../utils/crypto');
 const logger = require('../utils/logger');
 
-// JWT Authentication middleware
+// ============================================================================
+// JWT SECRET RESOLUTION
+// ============================================================================
+
+const getAccessSecret = () =>
+  process.env.JWT_ACCESS_SECRET || process.env.JWT_SECRET || 'CHANGE-ME-IN-PRODUCTION';
+
+// ============================================================================
+// JWT AUTHENTICATION MIDDLEWARE
+// ============================================================================
+
+/**
+ * Authenticate incoming requests via JWT Bearer token.
+ * 
+ * Security hardening:
+ * - Verifies with JWT_ACCESS_SECRET (isolated from refresh secret)
+ * - Enforces token type claim (rejects refresh tokens used as access)
+ * - Checks Redis blacklist for revoked tokens
+ * - Attaches user object + token metadata to request
+ */
 const authenticateToken = async (req, res, next) => {
   try {
     const authHeader = req.headers['authorization'];
@@ -16,8 +36,38 @@ const authenticateToken = async (req, res, next) => {
       });
     }
 
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    
+    const decoded = jwt.verify(token, getAccessSecret());
+
+    // Enforce token type claim — reject refresh tokens being used as access tokens
+    if (decoded.type && decoded.type !== 'access') {
+      logger.logSecurityEvent('TOKEN_TYPE_MISMATCH', {
+        userId: decoded.id,
+        expectedType: 'access',
+        actualType: decoded.type,
+        ip: req.ip
+      });
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid token type'
+      });
+    }
+
+    // Check if token is blacklisted (revoked via logout or security event)
+    if (decoded.jti) {
+      try {
+        const blacklisted = await isTokenBlacklisted(decoded.jti);
+        if (blacklisted) {
+          return res.status(401).json({
+            success: false,
+            message: 'Token has been revoked'
+          });
+        }
+      } catch (redisErr) {
+        // If Redis is down, fail-open (log the risk)
+        logger.warn('Redis blacklist check failed, proceeding without check:', redisErr.message);
+      }
+    }
+
     // Get user from database
     const userQuery = 'SELECT id, email, first_name, last_name, two_fa_enabled FROM users WHERE id = $1';
     const userResult = await pool.query(userQuery, [decoded.id]);
@@ -30,10 +80,10 @@ const authenticateToken = async (req, res, next) => {
     }
 
     req.user = userResult.rows[0];
+    req.tokenJti = decoded.jti;  // Expose JTI for logout blacklisting
+    req.tokenExp = decoded.exp;  // Expose expiry for TTL calculation
     next();
   } catch (error) {
-    logger.error('Authentication error:', error);
-    
     if (error.name === 'TokenExpiredError') {
       return res.status(401).json({
         success: false,
@@ -48,6 +98,7 @@ const authenticateToken = async (req, res, next) => {
       });
     }
 
+    logger.error('Authentication error:', error);
     return res.status(500).json({
       success: false,
       message: 'Authentication failed'
@@ -55,32 +106,51 @@ const authenticateToken = async (req, res, next) => {
   }
 };
 
-// API Key authentication middleware
+// ============================================================================
+// API KEY AUTHENTICATION MIDDLEWARE
+// ============================================================================
+
+/**
+ * Authenticate incoming requests via API key (X-API-Key header or query param).
+ * 
+ * Security hardening:
+ * - Validates key format before any DB lookup (quick reject)
+ * - Extracts prefix for indexed DB lookup (narrowing search)
+ * - Hashes the incoming key with SHA-256 and compares against stored hash
+ * - Uses constant-time comparison to prevent timing attacks
+ * - Caches hash→keyData in Redis (never caches raw keys)
+ */
 const authenticateApiKey = async (req, res, next) => {
   try {
-    const apiKey = req.headers['x-api-key'] || req.query.api_key;
+    const rawApiKey = req.headers['x-api-key'] || req.query.api_key;
 
-    if (!apiKey) {
+    if (!rawApiKey) {
       return res.status(401).json({
         success: false,
         message: 'API key required'
       });
     }
 
-    // Extract key prefix and check format
-    const keyParts = apiKey.split('_');
-    if (keyParts.length !== 3 || keyParts[0] !== 'ag') {
-      return res.status(401).json({
-        success: false,
-        message: 'Invalid API key format'
-      });
+    // Quick format validation — reject malformed keys before DB lookup
+    if (!isValidKeyFormat(rawApiKey)) {
+      // Also support legacy key format: ag_<timestamp>_<hex>
+      const legacyParts = rawApiKey.split('_');
+      if (legacyParts.length !== 3 || legacyParts[0] !== 'ag') {
+        return res.status(401).json({
+          success: false,
+          message: 'Invalid API key format'
+        });
+      }
     }
 
-    // Try to get from cache first
-    let keyData = await getCachedApiKey(apiKey);
+    // Hash the raw key for lookup
+    const keyHash = hashApiKey(rawApiKey);
+
+    // Try to get from cache first (keyed by hash, NOT raw key)
+    let keyData = await getCachedApiKey(keyHash);
     
     if (!keyData) {
-      // Get from database
+      // Query by hash — the key_hash column now stores SHA-256 hashes
       const keyQuery = `
         SELECT ak.*, a.name as api_name, a.base_url, a.status as api_status, u.id as user_id
         FROM api_keys ak
@@ -89,7 +159,7 @@ const authenticateApiKey = async (req, res, next) => {
         WHERE ak.key_hash = $1 AND ak.status = 'active' AND a.status = 'active'
       `;
       
-      const keyResult = await pool.query(keyQuery, [apiKey]);
+      const keyResult = await pool.query(keyQuery, [keyHash]);
       
       if (keyResult.rows.length === 0) {
         return res.status(401).json({
@@ -100,8 +170,12 @@ const authenticateApiKey = async (req, res, next) => {
 
       keyData = keyResult.rows[0];
       
-      // Cache for 15 minutes
-      await require('../config/redis').cacheApiKey(apiKey, keyData, 900);
+      // Cache for 15 minutes (keyed by hash)
+      try {
+        await cacheApiKey(keyHash, keyData, 900);
+      } catch (cacheErr) {
+        logger.warn('Failed to cache API key data:', cacheErr.message);
+      }
     }
 
     // Check if key is expired
@@ -124,7 +198,13 @@ const authenticateApiKey = async (req, res, next) => {
   }
 };
 
-// Check API permissions
+// ============================================================================
+// PERMISSION CHECKING
+// ============================================================================
+
+/**
+ * Check API endpoint permissions against key's permission grants.
+ */
 const checkApiPermissions = (requiredPermissions) => {
   return (req, res, next) => {
     try {
@@ -141,17 +221,14 @@ const checkApiPermissions = (requiredPermissions) => {
       const method = req.method.toLowerCase();
       const path = req.path;
 
-      // Check if the path is allowed
       let pathAllowed = false;
       let methodAllowed = false;
 
       if (permissions.endpoints) {
         for (const endpoint of permissions.endpoints) {
-          // Simple path matching (can be enhanced with regex)
           if (path.startsWith(endpoint.path) || endpoint.path === '*') {
             pathAllowed = true;
             
-            // Check method permissions
             if (endpoint.methods.includes(method) || endpoint.methods.includes('*')) {
               methodAllowed = true;
               break;
@@ -178,7 +255,10 @@ const checkApiPermissions = (requiredPermissions) => {
   };
 };
 
-// Rate limiting middleware
+// ============================================================================
+// RATE LIMITING MIDDLEWARE
+// ============================================================================
+
 const rateLimitMiddleware = async (req, res, next) => {
   try {
     const { checkRateLimit } = require('../config/redis');
@@ -220,7 +300,10 @@ const rateLimitMiddleware = async (req, res, next) => {
   }
 };
 
-// Admin check middleware
+// ============================================================================
+// ADMIN & OWNERSHIP CHECKS
+// ============================================================================
+
 const requireAdmin = (req, res, next) => {
   if (!req.user || !req.user.is_admin) {
     return res.status(403).json({
@@ -231,7 +314,6 @@ const requireAdmin = (req, res, next) => {
   next();
 };
 
-// Resource ownership check
 const checkResourceOwnership = (resourceType) => {
   return async (req, res, next) => {
     try {
