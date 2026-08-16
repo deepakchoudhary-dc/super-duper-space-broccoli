@@ -166,20 +166,13 @@ logger.rejections.handle(
   })
 );
 
-module.exports = {
-  logger,
-  apiUsageLogger,
-  securityLogger,
-  logApiUsage,
-  logSecurityEvent,
-  logError,
-  logInfo,
-  logWarn,
-  logDebug
-};
-
-// Use the default logger as the main export
+// ---------------------------------------------------------------------------
+// The main export is the winston logger itself (so `logger.info(...)` works),
+// with specialized helper methods attached for API usage + security events.
+// ---------------------------------------------------------------------------
 module.exports = logger;
+module.exports.apiUsageLogger = apiUsageLogger;
+module.exports.securityLogger = securityLogger;
 module.exports.logApiUsage = logApiUsage;
 module.exports.logSecurityEvent = logSecurityEvent;
 module.exports.logError = logError;

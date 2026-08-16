@@ -19,16 +19,37 @@
 - ⚡ **High-Performance Streaming Proxy**:
   - Keep-Alive HTTP/HTTPS connection pooling (`Map<baseUrl, Agent>`).
   - Zero-copy streaming pipeline (`req.pipe(proxyReq)` / `proxyRes.pipe(res)`) eliminating memory buffering bottlenecks.
-  - Non-blocking asynchronous audit logging on request completion.
+  - **WebSocket / SSE upgrade proxying** with full API-key auth, rate limiting, and SSRF checks.
+  - **Header sanitization**: dashboard JWTs, cookies, and raw API keys are never forwarded upstream.
+  - **SSRF protection**: upstream targets are validated against private/link-local/metadata ranges at registration and per-request.
+- ⚖️ **Multi-Tier Atomic Rate Limiting**:
+  - Redis Lua sliding-window with **burst (per-second), hourly, and daily quota tiers** per key — atomic, race-free.
+  - In-memory fallback when Redis is unavailable (graceful degradation).
+  - `RateLimit-Policy` / `X-RateLimit-*` headers per the IETF draft.
+- 🩺 **Upstream Resilience (Circuit Breaker + Health Checks)**:
+  - Per-upstream three-state circuit breaker (closed/open/half-open) with passive failure counting.
+  - Active `/health` probing with automatic unhealthy-node ejection.
+  - 503 fail-fast when an upstream circuit is open.
+- 🛡️ **WAF (Web Application Firewall)**:
+  - SQL injection, XSS, path traversal, command injection, and NoSQL injection detection on all API + proxy traffic.
+  - Blocked payloads are audit-logged as security events.
+- 📈 **Prometheus Metrics Endpoint** (`/metrics`):
+  - Request counters, latency histograms, rate-limit rejections, WAF blocks, upstream failures, circuit states, Redis availability.
 - 📊 **Real-Time Analytics & Monitoring**:
   - Interactive dashboards with latency graphs, throughput metrics (RPS), status code distributions, and error tracking.
   - Per-API and per-key usage telemetry.
+  - **Real alert data** — elevated error rates, expiring keys, and rate-limit pressure (no more mock endpoints).
 - 🛡️ **Defensive Hardening**:
   - Strict Content Security Policy (CSP), HTTP Strict Transport Security (HSTS), XSS protection, and frame-ancestors blocking via Helmet.
   - Granular rate limiting per IP, per user, and per API key.
   - Account lockout protection against brute-force attacks.
+  - **Fail-fast env validation** — production refuses to boot with missing/placeholder secrets.
+  - **Consistent password policy** (8+ chars with complexity) enforced at registration and reset.
+  - Email-change flow now issues a fresh verification token.
+  - Pagination clamped to prevent resource exhaustion.
+- 🔔 **Alerting Engine**: rate-limit-exceeded and security events trigger cooldown-throttled email notifications to key owners.
 - ⚙️ **Self-Healing Database & Graceful Fallbacks**:
-  - Automatic idempotent database schema migrations on startup.
+  - Automatic idempotent database schema migrations on startup (including legacy-table column backfills).
   - Graceful Redis fail-open fallback ensuring uptime even if the cache layer is down.
 
 ---
@@ -211,8 +232,30 @@ To ensure secrets, credentials, and sensitive assets are never leaked:
 | `npm run install:all`| Installs all dependencies across root, server, and client |
 | `npm run build` | Builds optimized React production bundle in `client/build` |
 | `npm test` | Runs both backend Jest tests and client test suite |
+| `npm run test:server` | Runs backend unit tests (46+ tests: crypto, WAF, rate limiter, SSRF, circuit breaker, config) |
+| `npm run test:integration` | Runs full-stack integration tests (requires Postgres + Redis; `RUN_INTEGRATION=true`) |
 | `npm run docker:up` | Starts all Docker containers via `docker-compose` |
 | `npm run docker:down`| Tears down all Docker containers and networks |
+
+## 📈 Observability
+
+- **Prometheus**: scrape `GET /metrics` (default). Metrics include `http_requests_total{method,path,status}`, `http_request_duration_seconds`, `gateway_rate_limit_exceeded_total{key_id,tier}`, `gateway_waf_blocked_total{category}`, `gateway_upstream_failures_total`, `gateway_circuit_breaker_state{api_id}`, `gateway_redis_available`, and Node.js process metrics.
+- **Deep health check**: `GET /health` reports `database` and `redis` connectivity (returns 503 when degraded).
+- **Tracing**: W3C `traceparent` is propagated to upstreams when present, and every response carries `X-Request-Id`.
+
+## 🛡️ Security Model
+
+| Control | Implementation |
+| :--- | :--- |
+| API keys at rest | SHA-256 hash, timing-safe compare (`crypto.timingSafeEqual`); raw key shown once |
+| JWT | Isolated access/refresh secrets, `type` claim enforcement, family rotation + replay detection |
+| SSRF | Scheme allowlist, private/link-local/metadata range rejection, per-request re-validation |
+| Proxy header hygiene | Authorization/cookie/raw key stripped before forwarding upstream |
+| WAF | SQLi / XSS / path traversal / command / NoSQL injection regex pipeline |
+| Rate limiting | Atomic Redis Lua sliding window, multi-tier (burst/hour/daily), memory fallback |
+| Upstream resilience | Circuit breaker + active health checks |
+| Container | Non-root `node` user, HEALTHCHECK, production deps only |
+| CI/CD | GitHub Actions: unit + integration tests against real Postgres/Redis, client build |
 
 ---
 

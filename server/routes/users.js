@@ -103,11 +103,13 @@ router.put('/profile', authenticateToken, updateProfileValidation, async (req, r
     
     // Build update query
     const updateFields = {};
+    let emailChanged = false;
     if (firstName !== undefined) updateFields.first_name = firstName;
     if (lastName !== undefined) updateFields.last_name = lastName;
-    if (email !== undefined) {
+    if (email !== undefined && email !== req.user.email) {
       updateFields.email = email;
       updateFields.is_email_verified = false; // Reset verification if email changed
+      emailChanged = true;
     }
     
     if (Object.keys(updateFields).length === 0) {
@@ -129,6 +131,35 @@ router.put('/profile', authenticateToken, updateProfileValidation, async (req, r
     const result = await pool.query(updateQuery, values);
     
     const updatedUser = result.rows[0];
+
+    // If email changed: issue a fresh verification token and email it
+    if (emailChanged && !process.env.SKIP_EMAIL_VERIFICATION === 'true') {
+      try {
+        const crypto = require('crypto');
+        const verificationToken = crypto.randomBytes(32).toString('hex');
+        const bcrypt = require('bcryptjs');
+        const tokenHash = await bcrypt.hash(verificationToken, 10);
+        const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+
+        await pool.query(
+          'INSERT INTO email_verification_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)',
+          [userId, tokenHash, expiresAt]
+        );
+
+        const { sendEmail } = require('../utils/email');
+        await sendEmail({
+          to: email,
+          subject: 'Verify your new API Guardian email address',
+          template: 'email-verification',
+          data: {
+            firstName: updatedUser.first_name || 'User',
+            verificationUrl: `${process.env.FRONTEND_URL || 'http://localhost:3000'}/verify-email?token=${verificationToken}&email=${encodeURIComponent(email)}`
+          }
+        });
+      } catch (emailError) {
+        logger.error('Failed to send new-email verification:', emailError);
+      }
+    }
     
     // Log audit event
     const auditQuery = `
@@ -327,7 +358,11 @@ router.get('/activity', authenticateToken, async (req, res) => {
 router.get('/dashboard', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
-    const { days = 30 } = req.query;
+    // SECURITY: clamp days, parameterized intervals (was interpolated into SQL)
+    const days = (() => {
+      const parsed = parseInt(req.query.days, 10);
+      return Number.isFinite(parsed) ? Math.max(1, Math.min(365, parsed)) : 30;
+    })();
     
     // Get overview statistics
     const overviewQuery = `
@@ -336,11 +371,11 @@ router.get('/dashboard', authenticateToken, async (req, res) => {
         (SELECT COUNT(*) FROM apis WHERE user_id = $1 AND status = 'active') as active_apis,
         (SELECT COUNT(*) FROM api_keys WHERE user_id = $1) as total_keys,
         (SELECT COUNT(*) FROM api_keys WHERE user_id = $1 AND status = 'active') as active_keys,
-        (SELECT COUNT(*) FROM api_usage_logs WHERE user_id = $1 AND created_at >= CURRENT_TIMESTAMP - INTERVAL '${parseInt(days)} days') as total_requests,
-        (SELECT COUNT(*) FROM api_usage_logs WHERE user_id = $1 AND status_code >= 400 AND created_at >= CURRENT_TIMESTAMP - INTERVAL '${parseInt(days)} days') as error_requests
+        (SELECT COUNT(*) FROM api_usage_logs WHERE user_id = $1 AND created_at >= CURRENT_TIMESTAMP - MAKE_INTERVAL(days => $2)) as total_requests,
+        (SELECT COUNT(*) FROM api_usage_logs WHERE user_id = $1 AND status_code >= 400 AND created_at >= CURRENT_TIMESTAMP - MAKE_INTERVAL(days => $2)) as error_requests
     `;
     
-    const overviewResult = await pool.query(overviewQuery, [userId]);
+    const overviewResult = await pool.query(overviewQuery, [userId, days]);
     const overview = overviewResult.rows[0];
     
     // Get daily usage for the last 30 days
@@ -365,14 +400,14 @@ router.get('/dashboard', authenticateToken, async (req, res) => {
         COUNT(aul.*) as request_count,
         MAX(aul.created_at) as last_used
       FROM apis a
-      LEFT JOIN api_usage_logs aul ON a.id = aul.api_id AND aul.created_at >= CURRENT_TIMESTAMP - INTERVAL '${parseInt(days)} days'
+      LEFT JOIN api_usage_logs aul ON a.id = aul.api_id AND aul.created_at >= CURRENT_TIMESTAMP - MAKE_INTERVAL(days => $2)
       WHERE a.user_id = $1
       GROUP BY a.id, a.name, a.base_url
       ORDER BY request_count DESC
       LIMIT 5
     `;
     
-    const topApisResult = await pool.query(topApisQuery, [userId]);
+    const topApisResult = await pool.query(topApisQuery, [userId, days]);
     
     // Get recent activity
     const recentActivityQuery = `
@@ -433,12 +468,13 @@ router.get('/dashboard', authenticateToken, async (req, res) => {
 router.get('/stats', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
-      const statsQuery = `
+    const statsQuery = `
       SELECT 
         (SELECT COUNT(*) FROM apis WHERE user_id = $1) as apis,
         (SELECT COUNT(*) FROM api_keys WHERE user_id = $1 AND status = 'active') as keys,
-        0 as requests,
-        '99.9%' as uptime
+        (SELECT COUNT(*) FROM api_usage_logs WHERE user_id = $1 AND created_at >= CURRENT_TIMESTAMP - INTERVAL '24 hours') as requests_last_24h,
+        (SELECT COUNT(*) FROM api_usage_logs WHERE user_id = $1 AND created_at >= CURRENT_TIMESTAMP - INTERVAL '30 days') as requests_last_30d,
+        (SELECT COALESCE(AVG(response_time), 0) FROM api_usage_logs WHERE user_id = $1 AND created_at >= CURRENT_TIMESTAMP - INTERVAL '24 hours') as avg_response_time
     `;
     
     const result = await pool.query(statsQuery, [userId]);
@@ -449,8 +485,9 @@ router.get('/stats', authenticateToken, async (req, res) => {
       data: {
         apis: parseInt(stats.apis) || 0,
         keys: parseInt(stats.keys) || 0,
-        requests: parseInt(stats.requests) || 0,
-        uptime: stats.uptime
+        requests: parseInt(stats.requests_last_24h) || 0,
+        requestsLast30d: parseInt(stats.requests_last_30d) || 0,
+        avgResponseTime: parseFloat(stats.avg_response_time) || 0
       }
     });
     
@@ -463,31 +500,54 @@ router.get('/stats', authenticateToken, async (req, res) => {
   }
 });
 
-// Get recent activity for dashboard
+// Get recent activity for dashboard (real data from audit_logs + usage spikes)
 router.get('/recent-activity', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
     
-    // Mock recent activity data for now
+    // Recent audit events (real data)
+    const activityQuery = `
+      SELECT action, resource_type, resource_id, details, created_at
+      FROM audit_logs
+      WHERE user_id = $1
+      ORDER BY created_at DESC
+      LIMIT 8
+    `;
+    const activityResult = await pool.query(activityQuery, [userId]);
+    
+    // Recent API usage spikes (error bursts or high traffic)
+    const spikesQuery = `
+      SELECT 
+        a.id as api_id, a.name as api_name,
+        COUNT(*) as request_count,
+        COUNT(CASE WHEN aul.status_code >= 400 THEN 1 END) as error_count,
+        MAX(aul.created_at) as last_used
+      FROM api_usage_logs aul
+      JOIN apis a ON aul.api_id = a.id
+      WHERE aul.user_id = $1 AND aul.created_at >= CURRENT_TIMESTAMP - INTERVAL '24 hours'
+      GROUP BY a.id, a.name
+      HAVING COUNT(*) > 100 OR COUNT(CASE WHEN aul.status_code >= 400 THEN 1 END) > 10
+      ORDER BY request_count DESC
+      LIMIT 3
+    `;
+    const spikesResult = await pool.query(spikesQuery, [userId]);
+    
     const recentActivity = [
-      {
-        type: 'api_created',
-        title: 'New API Created',
-        description: 'Weather API was successfully registered',
-        timestamp: '2 hours ago'
-      },
-      {
-        type: 'key_generated', 
-        title: 'API Key Generated',
-        description: 'New key generated for Payment API',
-        timestamp: '5 hours ago'
-      },
-      {
+      ...activityResult.rows.map(row => ({
+        type: 'activity',
+        title: formatActionTitle(row.action),
+        description: typeof row.details === 'string' ? row.details.slice(0, 120) : JSON.stringify(row.details || {}).slice(0, 120),
+        timestamp: row.created_at,
+        createdAt: row.created_at
+      })),
+      ...spikesResult.rows.map(row => ({
         type: 'request_spike',
         title: 'High Traffic Detected',
-        description: 'User Management API experiencing increased usage',
-        timestamp: '1 day ago'
-      }
+        description: `${row.api_name} — ${row.request_count} requests in the last 24h${row.error_count > 0 ? ` (${row.error_count} errors)` : ''}`,
+        timestamp: row.last_used,
+        createdAt: row.last_used,
+        apiId: row.api_id
+      }))
     ];
     
     res.json({
@@ -504,30 +564,85 @@ router.get('/recent-activity', authenticateToken, async (req, res) => {
   }
 });
 
-// Get alerts for dashboard
+// Get alerts for dashboard (real data: error rates, expiring keys, rate limit pressure)
 router.get('/alerts', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
-    
-    // Mock alerts data for now
-    const alerts = [
-      {
+    const alerts = [];
+
+    // 1. APIs with elevated error rates in the last hour
+    const errorRateQuery = `
+      SELECT a.name, a.id,
+             COUNT(*) as total,
+             COUNT(CASE WHEN aul.status_code >= 400 THEN 1 END) as errors
+      FROM api_usage_logs aul
+      JOIN apis a ON aul.api_id = a.id
+      WHERE aul.user_id = $1 AND aul.created_at >= CURRENT_TIMESTAMP - INTERVAL '1 hour'
+      GROUP BY a.id, a.name
+      HAVING COUNT(*) >= 10 AND (COUNT(CASE WHEN aul.status_code >= 400 THEN 1 END)::float / COUNT(*)) > 0.05
+      ORDER BY errors DESC
+      LIMIT 5
+    `;
+    const errorRateResult = await pool.query(errorRateQuery, [userId]);
+    for (const row of errorRateResult.rows) {
+      const rate = ((row.errors / row.total) * 100).toFixed(1);
+      alerts.push({
+        type: 'error',
+        title: 'Elevated Error Rate',
+        message: `${row.name} has a ${rate}% error rate in the last hour (${row.errors}/${row.total})`,
+        timestamp: new Date().toISOString(),
+        apiId: row.id
+      });
+    }
+
+    // 2. Keys expiring within 7 days
+    const expiringKeysQuery = `
+      SELECT ak.name, ak.expires_at, a.name as api_name
+      FROM api_keys ak
+      JOIN apis a ON ak.api_id = a.id
+      WHERE ak.user_id = $1 AND ak.status = 'active'
+        AND ak.expires_at IS NOT NULL
+        AND ak.expires_at BETWEEN CURRENT_TIMESTAMP AND CURRENT_TIMESTAMP + INTERVAL '7 days'
+      ORDER BY ak.expires_at ASC
+      LIMIT 5
+    `;
+    const expiringKeysResult = await pool.query(expiringKeysQuery, [userId]);
+    for (const row of expiringKeysResult.rows) {
+      alerts.push({
+        type: 'warning',
+        title: 'API Key Expiring Soon',
+        message: `Key "${row.name}" for ${row.api_name} expires ${new Date(row.expires_at).toLocaleDateString()}`,
+        timestamp: new Date().toISOString()
+      });
+    }
+
+    // 3. Rate-limit pressure — keys near their limit in the last 24h
+    const rateLimitPressureQuery = `
+      SELECT ak.id, ak.name, ak.rate_limit, a.name as api_name, COUNT(aul.*) as used
+      FROM api_keys ak
+      JOIN apis a ON ak.api_id = a.id
+      LEFT JOIN api_usage_logs aul ON ak.id = aul.api_key_id 
+        AND aul.created_at >= CURRENT_TIMESTAMP - INTERVAL '24 hours'
+      WHERE ak.user_id = $1 AND ak.status = 'active'
+      GROUP BY ak.id, ak.name, ak.rate_limit, a.name
+      HAVING ak.rate_limit > 0 AND COUNT(aul.*) >= ak.rate_limit * 0.8
+      ORDER BY used DESC
+      LIMIT 5
+    `;
+    const pressureResult = await pool.query(rateLimitPressureQuery, [userId]);
+    for (const row of pressureResult.rows) {
+      const pct = ((row.used / row.rate_limit) * 100).toFixed(0);
+      alerts.push({
         type: 'warning',
         title: 'Rate Limit Approaching',
-        message: 'Payment API is at 80% of rate limit',
-        timestamp: '30 minutes ago'
-      },
-      {
-        type: 'info',
-        title: 'New Feature Available',
-        message: 'Enhanced analytics now available for all APIs',
-        timestamp: '2 days ago'
-      }
-    ];
-    
+        message: `${row.api_name} key "${row.name}" has used ${pct}% of its ${row.rate_limit}/24h allowance`,
+        timestamp: new Date().toISOString()
+      });
+    }
+
     res.json({
       success: true,
-      data: alerts
+      data: alerts.slice(0, 10)
     });
     
   } catch (error) {
@@ -538,5 +653,29 @@ router.get('/alerts', authenticateToken, async (req, res) => {
     });
   }
 });
+
+// Helper: human-readable action title
+function formatActionTitle(action) {
+  const titles = {
+    USER_LOGIN: 'User logged in',
+    USER_LOGOUT: 'User logged out',
+    USER_REGISTERED: 'Account created',
+    API_CREATED: 'API registered',
+    API_UPDATED: 'API updated',
+    API_DELETED: 'API deleted',
+    API_KEY_CREATED: 'API key created',
+    API_KEY_UPDATED: 'API key updated',
+    API_KEY_REVOKED: 'API key revoked',
+    API_KEY_REGENERATED: 'API key regenerated',
+    API_KEY_DELETED: 'API key deleted',
+    PASSWORD_CHANGED: 'Password changed',
+    PASSWORD_RESET_SUCCESSFUL: 'Password reset',
+    TWO_FA_ENABLED: '2FA enabled',
+    TWO_FA_DISABLED: '2FA disabled',
+    SETTINGS_UPDATED: 'Settings updated',
+    PROFILE_UPDATED: 'Profile updated'
+  };
+  return titles[action] || action.replace(/_/g, ' ').toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase());
+}
 
 module.exports = router;

@@ -4,12 +4,14 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
-require('dotenv').config({ path: path.join(__dirname, '.env') });
 
+const config = require('./config/env');
 const { connectDB, pool } = require('./config/database');
-const { connectRedis } = require('./config/redis');
+const { connectRedis, isRedisAvailable } = require('./config/redis');
 const logger = require('./utils/logger');
 const errorHandler = require('./middleware/errorHandler');
+const { wafMiddleware } = require('./utils/waf');
+const metrics = require('./utils/metrics');
 
 // Route imports
 const authRoutes = require('./routes/auth');
@@ -22,7 +24,7 @@ const docsRoutes = require('./routes/docs');
 const settingsRoutes = require('./routes/settings');
 
 const app = express();
-const PORT = process.env.PORT || 5000;
+const PORT = config.port;
 
 // ============================================================================
 // SECURITY MIDDLEWARE — Hardened Helmet Configuration
@@ -59,17 +61,24 @@ app.use(helmet({
 }));
 
 // ============================================================================
-// REQUEST ID INJECTION — Traceability for every request
+// REQUEST ID + TRACE CONTEXT INJECTION
 // ============================================================================
 
 app.use((req, res, next) => {
   req.requestId = req.headers['x-request-id'] || uuidv4();
   res.setHeader('X-Request-Id', req.requestId);
+
+  // W3C trace context propagation — pass through or generate
+  if (!req.headers['traceparent']) {
+    const traceId = require('crypto').randomBytes(16).toString('hex');
+    const spanId = require('crypto').randomBytes(8).toString('hex');
+    req.headers['traceparent'] = `00-${traceId}-${spanId}-01`;
+  }
   next();
 });
 
 // ============================================================================
-// RATE LIMITING
+// RATE LIMITING (global per-IP for management API)
 // ============================================================================
 
 const limiter = rateLimit({
@@ -86,7 +95,7 @@ app.use('/api/', limiter);
 // ============================================================================
 
 const getAllowedOrigins = () => {
-  const origins = process.env.FRONTEND_URL || 'http://localhost:3000';
+  const origins = config.frontendUrl;
   return origins.split(',').map(o => o.trim());
 };
 
@@ -103,8 +112,8 @@ app.use(cors({
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key', 'X-Request-Id'],
-  exposedHeaders: ['X-Request-Id', 'X-RateLimit-Limit', 'X-RateLimit-Remaining', 'X-RateLimit-Reset'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key', 'X-Request-Id', 'traceparent'],
+  exposedHeaders: ['X-Request-Id', 'X-RateLimit-Limit', 'X-RateLimit-Remaining', 'X-RateLimit-Reset', 'RateLimit-Policy'],
   maxAge: 86400  // Cache preflight for 24 hours
 }));
 
@@ -116,10 +125,19 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // ============================================================================
-// REQUEST LOGGING
+// REQUEST LOGGING + ACTIVE CONNECTION GAUGE
 // ============================================================================
 
+let activeConnections = 0;
+
 app.use((req, res, next) => {
+  activeConnections += 1;
+  metrics.setActiveConnections(activeConnections);
+  res.on('finish', () => {
+    activeConnections -= 1;
+    metrics.setActiveConnections(activeConnections);
+  });
+
   logger.info(`${req.method} ${req.url}`, {
     requestId: req.requestId,
     ip: req.ip,
@@ -130,16 +148,49 @@ app.use((req, res, next) => {
 });
 
 // ============================================================================
-// HEALTH CHECK
+// WAF — attack pattern filtering on all API + proxy traffic
 // ============================================================================
 
-app.get('/health', (req, res) => {
-  res.status(200).json({
-    status: 'OK',
+app.use(wafMiddleware);
+
+// ============================================================================
+// HEALTH CHECK — deep: verifies DB and Redis connectivity
+// ============================================================================
+
+app.get('/health', async (req, res) => {
+  let dbOk = false;
+  let redisOk = false;
+
+  try {
+    const dbResult = await pool.query('SELECT 1');
+    dbOk = dbResult.rows[0]['?column?'] === 1;
+  } catch (err) {
+    logger.error('Health check DB failure:', err.message);
+  }
+
+  redisOk = isRedisAvailable();
+
+  const healthy = dbOk && redisOk;
+  res.status(healthy ? 200 : 503).json({
+    status: healthy ? 'OK' : 'DEGRADED',
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
-    version: process.env.npm_package_version || '1.0.0'
+    version: process.env.npm_package_version || '1.0.0',
+    checks: {
+      database: dbOk ? 'ok' : 'down',
+      redis: redisOk ? 'ok' : 'down'
+    }
   });
+});
+
+// ============================================================================
+// PROMETHEUS METRICS ENDPOINT
+// ============================================================================
+
+app.get(config.observability.metricsPath, async (req, res) => {
+  metrics.setRedisAvailable(isRedisAvailable());
+  res.setHeader('Content-Type', metrics.getContentType());
+  res.send(await metrics.getMetrics());
 });
 
 // ============================================================================
@@ -161,9 +212,9 @@ app.use('/proxy', proxyRoutes);
 // STATIC FILES (Production)
 // ============================================================================
 
-if (process.env.NODE_ENV === 'production') {
+if (config.isProduction) {
   app.use(express.static('client/build'));
-  
+
   app.get('*', (req, res) => {
     res.sendFile(path.join(__dirname, '../client/build/index.html'));
   });
@@ -194,18 +245,28 @@ async function startServer() {
     // Connect to databases
     await connectDB();
     await connectRedis();
-    
+
     server = app.listen(PORT, () => {
       logger.info(`Server running on port ${PORT}`);
+      // eslint-disable-next-line no-console
       console.log(`🚀 API Guardian server running on port ${PORT}`);
+      // eslint-disable-next-line no-console
       console.log(`📊 Health check: http://localhost:${PORT}/health`);
-      if (process.env.NODE_ENV !== 'production') {
+      // eslint-disable-next-line no-console
+      console.log(`📈 Metrics: http://localhost:${PORT}${config.observability.metricsPath}`);
+      if (config.env !== 'production') {
+        // eslint-disable-next-line no-console
         console.log(`📖 API Docs: http://localhost:${PORT}/api/docs`);
       }
     });
 
     // Set server timeout
     server.setTimeout(30000);
+
+    // WebSocket / SSE upgrade support for the proxy
+    server.on('upgrade', (req, socket, head) => {
+      proxyRoutes.handleUpgrade(req, socket, head);
+    });
   } catch (error) {
     logger.error('Failed to start server:', error);
     process.exit(1);
@@ -218,11 +279,11 @@ async function startServer() {
 
 const gracefulShutdown = async (signal) => {
   logger.info(`${signal} received, shutting down gracefully`);
-  
+
   if (server) {
     server.close(async () => {
       logger.info('HTTP server closed');
-      
+
       // Close database pool
       try {
         await pool.end();
@@ -230,7 +291,7 @@ const gracefulShutdown = async (signal) => {
       } catch (err) {
         logger.error('Error closing database pool:', err);
       }
-      
+
       // Close Redis
       try {
         const { getRedisClient } = require('./config/redis');
@@ -242,10 +303,18 @@ const gracefulShutdown = async (signal) => {
       } catch (err) {
         logger.error('Error closing Redis:', err);
       }
-      
+
+      // Close proxy agents + circuit breakers
+      try {
+        require('./utils/circuitBreaker').destroyAll();
+        logger.info('Proxy resources cleaned up');
+      } catch (err) {
+        logger.error('Error cleaning proxy resources:', err);
+      }
+
       process.exit(0);
     });
-    
+
     // Force shutdown after 10 seconds
     setTimeout(() => {
       logger.error('Forced shutdown after timeout');

@@ -2,14 +2,14 @@ const jwt = require('jsonwebtoken');
 const { pool } = require('../config/database');
 const { getCachedApiKey, cacheApiKey, isTokenBlacklisted } = require('../config/redis');
 const { hashApiKey, isValidKeyFormat, extractKeyPrefix, verifyApiKey } = require('../utils/crypto');
+const config = require('../config/env');
 const logger = require('../utils/logger');
 
 // ============================================================================
 // JWT SECRET RESOLUTION
 // ============================================================================
 
-const getAccessSecret = () =>
-  process.env.JWT_ACCESS_SECRET || process.env.JWT_SECRET || 'CHANGE-ME-IN-PRODUCTION';
+const getAccessSecret = () => config.jwt.accessSecret;
 
 // ============================================================================
 // JWT AUTHENTICATION MIDDLEWARE
@@ -228,8 +228,10 @@ const checkApiPermissions = (requiredPermissions) => {
         for (const endpoint of permissions.endpoints) {
           if (path.startsWith(endpoint.path) || endpoint.path === '*') {
             pathAllowed = true;
-            
-            if (endpoint.methods.includes(method) || endpoint.methods.includes('*')) {
+
+            // Methods may be stored upper/lower/mixed — compare case-insensitively
+            const allowedMethods = (endpoint.methods || []).map((m) => m.toLowerCase());
+            if (allowedMethods.includes(method) || allowedMethods.includes('*')) {
               methodAllowed = true;
               break;
             }
@@ -261,9 +263,12 @@ const checkApiPermissions = (requiredPermissions) => {
 
 const rateLimitMiddleware = async (req, res, next) => {
   try {
-    const { checkRateLimit } = require('../config/redis');
+    // Atomic multi-tier limiter (Redis Lua sliding window + memory fallback)
+    const { checkRateLimit } = require('../utils/rateLimiter');
+    const { incrementRateLimitExceeded } = require('../utils/metrics');
+    const { notifyRateLimitExceeded } = require('../utils/alerts');
     const { apiKey } = req;
-    
+
     if (!apiKey) {
       return next();
     }
@@ -272,23 +277,46 @@ const rateLimitMiddleware = async (req, res, next) => {
     const limit = apiKey.rate_limit || 1000;
     const window = apiKey.rate_limit_window || 3600;
 
-    const rateResult = await checkRateLimit(identifier, limit, window);
+    const rateResult = await checkRateLimit(identifier, {
+      limit,
+      window,
+      burst: apiKey.burst_limit,
+      hourly: apiKey.hourly_limit,
+      daily: apiKey.daily_limit
+    });
 
-    // Add rate limit headers
+    // Rate limit headers (per the most restrictive tier evaluated)
     res.set({
-      'X-RateLimit-Limit': limit,
-      'X-RateLimit-Remaining': Math.max(0, limit - rateResult.current),
-      'X-RateLimit-Reset': rateResult.resetTime
+      'X-RateLimit-Limit': String(rateResult.limit || limit),
+      'X-RateLimit-Remaining': String(Math.max(0, rateResult.remaining)),
+      'X-RateLimit-Reset': String(rateResult.resetInSeconds),
+      'RateLimit-Policy': `${rateResult.limit || limit};w=${window}`
     });
 
     if (!rateResult.allowed) {
+      incrementRateLimitExceeded(apiKey.id, rateResult.tier);
+      logger.logSecurityEvent('RATE_LIMIT_EXCEEDED', {
+        keyId: apiKey.id,
+        keyName: apiKey.name,
+        apiId: apiKey.api_id,
+        tier: rateResult.tier,
+        current: rateResult.current,
+        limit: rateResult.limit || limit,
+        ip: req.ip
+      });
+
+      // Alert the key owner (email, cooldown-throttled)
+      notifyRateLimitExceeded(apiKey, rateResult.current).catch(() => {});
+
+      res.setHeader('Retry-After', String(rateResult.resetInSeconds));
       return res.status(429).json({
         success: false,
         message: 'Rate limit exceeded',
         rateLimit: {
-          limit,
+          limit: rateResult.limit || limit,
           current: rateResult.current,
-          resetTime: rateResult.resetTime
+          resetInSeconds: rateResult.resetInSeconds,
+          tier: rateResult.tier
         }
       });
     }
@@ -296,7 +324,7 @@ const rateLimitMiddleware = async (req, res, next) => {
     next();
   } catch (error) {
     logger.error('Rate limiting error:', error);
-    next(); // Continue without rate limiting if Redis fails
+    next(); // Continue without rate limiting on internal failure (fail-open)
   }
 };
 

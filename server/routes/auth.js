@@ -11,6 +11,7 @@ const { pool } = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 const { sendEmail } = require('../utils/email');
 const { generateSecureToken } = require('../utils/crypto');
+const config = require('../config/env');
 const {
   blacklistToken,
   setRefreshTokenFamily,
@@ -27,11 +28,9 @@ const router = express.Router();
 
 // JWT Secret Resolution — separate secrets for access & refresh tokens
 // to prevent cross-purpose token abuse
-const getAccessSecret = () =>
-  process.env.JWT_ACCESS_SECRET || process.env.JWT_SECRET || 'CHANGE-ME-IN-PRODUCTION';
+const getAccessSecret = () => config.jwt.accessSecret;
 
-const getRefreshSecret = () =>
-  process.env.JWT_REFRESH_SECRET || process.env.JWT_SECRET || 'CHANGE-ME-IN-PRODUCTION';
+const getRefreshSecret = () => config.jwt.refreshSecret;
 
 // Rate limiting for auth endpoints
 const authLimiter = rateLimit({
@@ -55,9 +54,15 @@ const registerLimiter = rateLimit({
 });
 
 // Validation rules
+// Password policy is consistent with reset-password: 8+ chars with upper,
+// lower, digit, and special character.
+const PASSWORD_POLICY = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{8,}$/;
+
 const registerValidation = [
   body('email').isEmail().withMessage('Please provide a valid email address').normalizeEmail(),
-  body('password').isLength({ min: 6 }).withMessage('Password must be at least 6 characters long'),
+  body('password')
+    .isLength({ min: 8 }).withMessage('Password must be at least 8 characters long')
+    .matches(PASSWORD_POLICY).withMessage('Password must include uppercase, lowercase, number, and special character'),
   body('firstName').trim().notEmpty().withMessage('First name is required'),
   body('lastName').trim().notEmpty().withMessage('Last name is required')
 ];
@@ -88,13 +93,13 @@ const generateTokens = (userId) => {
   const accessToken = jwt.sign(
     { id: userId, type: 'access', jti: accessJti },
     getAccessSecret(),
-    { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
+    { expiresIn: config.jwt.accessExpiresIn }
   );
 
   const refreshToken = jwt.sign(
     { id: userId, type: 'refresh', jti: refreshJti, family: familyId },
     getRefreshSecret(),
-    { expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '30d' }
+    { expiresIn: config.jwt.refreshExpiresIn }
   );
 
   // Store refresh token family in Redis for rotation tracking
@@ -131,6 +136,30 @@ const logAuditEvent = async (userId, action, details = {}, req) => {
 // REGISTER ENDPOINT
 // ============================================================================
 
+/**
+ * @openapi
+ * /api/auth/register:
+ *   post:
+ *     summary: Register a new user account
+ *     tags: [Authentication]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [email, password, firstName, lastName]
+ *             properties:
+ *               email: { type: string, format: email }
+ *               password: { type: string, minLength: 8 }
+ *               firstName: { type: string }
+ *               lastName: { type: string }
+ *     responses:
+ *       201:
+ *         description: User registered successfully
+ *       400:
+ *         description: Validation error
+ */
 router.post('/register', registerLimiter, registerValidation, async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -155,11 +184,11 @@ router.post('/register', registerLimiter, registerValidation, async (req, res) =
     }
 
     // Hash password
-    const saltRounds = parseInt(process.env.BCRYPT_ROUNDS) || 12;
+    const saltRounds = config.security.bcryptRounds;
     const passwordHash = await bcrypt.hash(password, saltRounds);
 
     // Check if email verification should be skipped (dev convenience)
-    const skipVerification = process.env.SKIP_EMAIL_VERIFICATION === 'true';
+    const skipVerification = config.security.skipEmailVerification;
 
     // Create user
     const userQuery = `
@@ -236,6 +265,31 @@ router.post('/register', registerLimiter, registerValidation, async (req, res) =
 // LOGIN ENDPOINT
 // ============================================================================
 
+/**
+ * @openapi
+ * /api/auth/login:
+ *   post:
+ *     summary: Log in and receive access + refresh tokens
+ *     tags: [Authentication]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [email, password]
+ *             properties:
+ *               email: { type: string, format: email }
+ *               password: { type: string }
+ *               twoFactorCode: { type: string, description: Required if 2FA is enabled }
+ *     responses:
+ *       200:
+ *         description: Login successful (or 2FA required)
+ *       401:
+ *         description: Invalid credentials
+ *       423:
+ *         description: Account locked
+ */
 router.post('/login', authLimiter, loginValidation, async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -279,7 +333,7 @@ router.post('/login', authLimiter, loginValidation, async (req, res) => {
     }
 
     // Check email verification (with env bypass for development)
-    const skipVerification = process.env.SKIP_EMAIL_VERIFICATION === 'true';
+    const skipVerification = config.security.skipEmailVerification;
     if (!skipVerification && !user.is_email_verified) {
       return res.status(403).json({
         success: false,
@@ -293,8 +347,8 @@ router.post('/login', authLimiter, loginValidation, async (req, res) => {
     if (!isPasswordValid) {
       // Increment failed attempts
       const failedAttempts = (user.failed_login_attempts || 0) + 1;
-      const maxAttempts = parseInt(process.env.MAX_LOGIN_ATTEMPTS) || 5;
-      const lockoutTime = parseInt(process.env.LOCKOUT_TIME) || 15 * 60 * 1000; // 15 minutes
+      const maxAttempts = config.security.maxLoginAttempts;
+      const lockoutTime = config.security.lockoutTimeMs;
 
       let lockedUntil = null;
       if (failedAttempts >= maxAttempts) {
@@ -391,7 +445,18 @@ router.post('/login', authLimiter, loginValidation, async (req, res) => {
 // EMAIL VERIFICATION ENDPOINT
 // ============================================================================
 
-router.post('/verify-email', async (req, res) => {
+const verifyEmailLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  message: {
+    success: false,
+    message: 'Too many verification attempts, please try again later'
+  },
+  standardHeaders: true,
+  legacyHeaders: false
+});
+
+router.post('/verify-email', verifyEmailLimiter, async (req, res) => {
   try {
     const { token, email } = req.body;
 
@@ -736,6 +801,20 @@ router.post('/logout', authenticateToken, async (req, res) => {
 // GET CURRENT USER
 // ============================================================================
 
+/**
+ * @openapi
+ * /api/auth/me:
+ *   get:
+ *     summary: Get the currently authenticated user
+ *     tags: [Authentication]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Current user profile
+ *       401:
+ *         description: Missing or invalid token
+ */
 router.get('/me', authenticateToken, async (req, res) => {
   try {
     const userQuery = `
@@ -909,7 +988,7 @@ router.post('/reset-password', [
       });
     }
 
-    const saltRounds = parseInt(process.env.BCRYPT_ROUNDS) || 12;
+    const saltRounds = config.security.bcryptRounds;
     const passwordHash = await bcrypt.hash(password, saltRounds);
 
     await pool.query('BEGIN');
@@ -948,7 +1027,39 @@ router.post('/reset-password', [
 // REFRESH TOKEN — With Family Rotation & Stolen Token Detection
 // ============================================================================
 
-router.post('/refresh', [
+const refreshLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  message: {
+    success: false,
+    message: 'Too many refresh attempts, please try again later'
+  },
+  standardHeaders: true,
+  legacyHeaders: false
+});
+
+/**
+ * @openapi
+ * /api/auth/refresh:
+ *   post:
+ *     summary: Rotate a refresh token and receive a new token pair
+ *     tags: [Authentication]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [refreshToken]
+ *             properties:
+ *               refreshToken: { type: string }
+ *     responses:
+ *       200:
+ *         description: Tokens refreshed
+ *       401:
+ *         description: Invalid/expired refresh token or replay detected
+ */
+router.post('/refresh', refreshLimiter, [
   body('refreshToken').notEmpty()
 ], async (req, res) => {
   try {

@@ -1,4 +1,5 @@
 const express = require('express');
+const path = require('path');
 const swaggerJsdoc = require('swagger-jsdoc');
 const swaggerUi = require('swagger-ui-express');
 
@@ -125,7 +126,10 @@ const swaggerOptions = {
       }
     ]
   },
-  apis: ['./routes/*.js'], // Path to the API files
+  // FIXED: previously `./routes/*.js` resolved relative to process.cwd()
+  // (the repo root when running `npm run dev`), so swagger-jsdoc found 0 files.
+  // Now resolves to the actual routes directory regardless of cwd.
+  apis: [path.join(__dirname, '*.js')],
 };
 
 const swaggerSpec = swaggerJsdoc(swaggerOptions);

@@ -20,6 +20,10 @@ const createKeyValidation = [
   body('permissions').optional({ checkFalsy: true, nullable: true }),
   body('rateLimit').optional({ checkFalsy: true, nullable: true }).isInt({ min: 1, max: 100000 }),
   body('rateLimitWindow').optional({ checkFalsy: true, nullable: true }).isInt({ min: 1, max: 86400 }),
+  // Multi-tier quota limits (0 = disabled)
+  body('burstLimit').optional({ checkFalsy: true, nullable: true }).isInt({ min: 0, max: 100000 }),
+  body('hourlyLimit').optional({ checkFalsy: true, nullable: true }).isInt({ min: 0, max: 10000000 }),
+  body('dailyLimit').optional({ checkFalsy: true, nullable: true }).isInt({ min: 0, max: 100000000 }),
   body('expiresAt').optional({ checkFalsy: true, nullable: true })
 ];
 
@@ -29,6 +33,9 @@ const updateKeyValidation = [
   body('permissions').optional({ checkFalsy: true, nullable: true }),
   body('rateLimit').optional({ checkFalsy: true, nullable: true }).isInt({ min: 1, max: 100000 }),
   body('rateLimitWindow').optional({ checkFalsy: true, nullable: true }).isInt({ min: 1, max: 86400 }),
+  body('burstLimit').optional({ checkFalsy: true, nullable: true }).isInt({ min: 0, max: 100000 }),
+  body('hourlyLimit').optional({ checkFalsy: true, nullable: true }).isInt({ min: 0, max: 10000000 }),
+  body('dailyLimit').optional({ checkFalsy: true, nullable: true }).isInt({ min: 0, max: 100000000 }),
   body('status').optional().isIn(['active', 'inactive', 'revoked']),
   body('expiresAt').optional({ checkFalsy: true, nullable: true })
 ];
@@ -62,16 +69,37 @@ const logAuditEvent = async (userId, action, resourceId, details, req) => {
 // GET ALL API KEYS
 // ============================================================================
 
+/**
+ * @openapi
+ * /api/keys:
+ *   get:
+ *     summary: List API keys for the authenticated user
+ *     tags: [API Keys]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - { name: page, in: query, schema: { type: integer } }
+ *       - { name: limit, in: query, schema: { type: integer, maximum: 100 } }
+ *       - { name: status, in: query, schema: { type: string, enum: [active, inactive, revoked] } }
+ *       - { name: apiId, in: query, schema: { type: string } }
+ *     responses:
+ *       200:
+ *         description: Paginated list of API keys (never includes raw keys)
+ */
 router.get('/', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
-    const { page = 1, limit = 10, status, apiId, search } = req.query;
+    // SECURITY: clamp pagination to prevent resource-exhaustion
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 10));
+    const { status, apiId, search } = req.query;
     
     const offset = (page - 1) * limit;
     
     let query = `
       SELECT ak.id, ak.name, ak.description, ak.key_prefix, ak.api_id, ak.permissions,
-             ak.rate_limit, ak.rate_limit_window, ak.status, ak.expires_at, ak.last_used,
+             ak.rate_limit, ak.rate_limit_window, ak.burst_limit, ak.hourly_limit, ak.daily_limit,
+             ak.status, ak.expires_at, ak.last_used,
              ak.created_at, ak.updated_at,
              a.name as api_name, a.base_url as api_base_url,
              (SELECT COUNT(*) FROM api_usage_logs WHERE api_key_id = ak.id AND created_at >= CURRENT_DATE - INTERVAL '30 days') as usage_last_30_days
@@ -151,6 +179,9 @@ router.get('/', authenticateToken, async (req, res) => {
           permissions: key.permissions,
           rateLimit: key.rate_limit,
           rateLimitWindow: key.rate_limit_window,
+          burstLimit: key.burst_limit,
+          hourlyLimit: key.hourly_limit,
+          dailyLimit: key.daily_limit,
           status: key.status,
           expiresAt: key.expires_at,
           lastUsed: key.last_used,
@@ -247,6 +278,33 @@ router.get('/:id', authenticateToken, checkResourceOwnership('api_key'), async (
 // CREATE API KEY — With SHA-256 Hashing (plaintext NEVER stored)
 // ============================================================================
 
+/**
+ * @openapi
+ * /api/keys:
+ *   post:
+ *     summary: Create a new API key (SHA-256 hashed; plaintext shown once)
+ *     tags: [API Keys]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [name, apiId]
+ *             properties:
+ *               name: { type: string }
+ *               apiId: { type: string }
+ *               rateLimit: { type: integer, description: Requests per window }
+ *               rateLimitWindow: { type: integer, description: Window in seconds }
+ *               burstLimit: { type: integer, description: Optional per-second burst allowance }
+ *               hourlyLimit: { type: integer, description: Optional hourly quota }
+ *               dailyLimit: { type: integer, description: Optional daily quota }
+ *     responses:
+ *       201:
+ *         description: Key created; data.key.apiKey contains the raw key (returned once)
+ */
 router.post('/', authenticateToken, createKeyValidation, async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -267,6 +325,9 @@ router.post('/', authenticateToken, createKeyValidation, async (req, res) => {
       permissions, 
       rateLimit, 
       rateLimitWindow, 
+      burstLimit,
+      hourlyLimit,
+      dailyLimit,
       expiresAt 
     } = req.body;
 
@@ -313,11 +374,13 @@ router.post('/', authenticateToken, createKeyValidation, async (req, res) => {
     const keyQuery = `
       INSERT INTO api_keys (
         api_id, user_id, key_hash, key_prefix, name, description, 
-        permissions, rate_limit, rate_limit_window, expires_at
+        permissions, rate_limit, rate_limit_window, expires_at,
+        burst_limit, hourly_limit, daily_limit
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
       RETURNING id, name, description, key_prefix, api_id, permissions,
-                rate_limit, rate_limit_window, status, expires_at, created_at
+                rate_limit, rate_limit_window, burst_limit, hourly_limit, daily_limit,
+                status, expires_at, created_at
     `;
 
     const keyResult = await pool.query(keyQuery, [
@@ -330,7 +393,10 @@ router.post('/', authenticateToken, createKeyValidation, async (req, res) => {
       JSON.stringify(defaultPermissions),
       rateLimit || 1000,
       rateLimitWindow || 3600,
-      expiresAt || null
+      expiresAt || null,
+      burstLimit || 0,
+      hourlyLimit || 0,
+      dailyLimit || 0
     ]);
 
     const newKey = keyResult.rows[0];
@@ -386,6 +452,9 @@ router.post('/', authenticateToken, createKeyValidation, async (req, res) => {
           permissions: newKey.permissions,
           rateLimit: newKey.rate_limit,
           rateLimitWindow: newKey.rate_limit_window,
+          burstLimit: newKey.burst_limit,
+          hourlyLimit: newKey.hourly_limit,
+          dailyLimit: newKey.daily_limit,
           status: newKey.status,
           expiresAt: newKey.expires_at,
           createdAt: newKey.created_at
@@ -460,6 +529,9 @@ router.put('/:id', authenticateToken, checkResourceOwnership('api_key'), updateK
     const setClause = updateKeys.map((key, index) => {
       const dbField = key === 'rateLimit' ? 'rate_limit' : 
                       key === 'rateLimitWindow' ? 'rate_limit_window' : 
+                      key === 'burstLimit' ? 'burst_limit' :
+                      key === 'hourlyLimit' ? 'hourly_limit' :
+                      key === 'dailyLimit' ? 'daily_limit' :
                       key === 'expiresAt' ? 'expires_at' : key;
       return `${dbField} = $${index + 2}`;
     }).join(', ');

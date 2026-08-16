@@ -5,12 +5,24 @@ const logger = require('../utils/logger');
 
 const router = express.Router();
 
+/**
+ * SECURITY: clamp `days` to [1, 365] — previously interpolated raw into
+ * `INTERVAL '${parseInt(days)} days'` which allowed NaN crashes (`INTERVAL 'NaN days'`)
+ * and unbounded/negative windows. All intervals now use parameterized
+ * MAKE_INTERVAL(days => $N).
+ */
+const safeDays = (value, fallback = 30) => {
+  const parsed = parseInt(value, 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(1, Math.min(365, parsed));
+};
+
 // Get overall analytics for user's APIs
 router.get('/overview', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
-    const { days = 30 } = req.query;
-    
+    const days = safeDays(req.query.days);
+
     const analyticsQuery = `
       SELECT 
         COUNT(DISTINCT aul.api_id) as active_apis,
@@ -23,12 +35,12 @@ router.get('/overview', authenticateToken, async (req, res) => {
         SUM(aul.response_size) as total_response_size,
         COUNT(DISTINCT aul.ip_address) as unique_ips
       FROM api_usage_logs aul
-      WHERE aul.user_id = $1 AND aul.created_at >= CURRENT_TIMESTAMP - INTERVAL '${parseInt(days)} days'
+      WHERE aul.user_id = $1 AND aul.created_at >= CURRENT_TIMESTAMP - MAKE_INTERVAL(days => $2)
     `;
-    
-    const result = await pool.query(analyticsQuery, [userId]);
+
+    const result = await pool.query(analyticsQuery, [userId, days]);
     const analytics = result.rows[0];
-    
+
     // Get time series data
     const timeSeriesQuery = `
       SELECT 
@@ -38,13 +50,13 @@ router.get('/overview', authenticateToken, async (req, res) => {
         COUNT(CASE WHEN status_code >= 400 THEN 1 END) as error_requests,
         AVG(response_time) as avg_response_time
       FROM api_usage_logs
-      WHERE user_id = $1 AND created_at >= CURRENT_TIMESTAMP - INTERVAL '${parseInt(days)} days'
+      WHERE user_id = $1 AND created_at >= CURRENT_TIMESTAMP - MAKE_INTERVAL(days => $2)
       GROUP BY DATE_TRUNC('day', created_at)
       ORDER BY date DESC
     `;
-    
-    const timeSeriesResult = await pool.query(timeSeriesQuery, [userId]);
-    
+
+    const timeSeriesResult = await pool.query(timeSeriesQuery, [userId, days]);
+
     res.json({
       success: true,
       data: {
@@ -70,7 +82,7 @@ router.get('/overview', authenticateToken, async (req, res) => {
         }))
       }
     });
-    
+
   } catch (error) {
     logger.error('Get analytics overview error:', error);
     res.status(500).json({
@@ -85,21 +97,22 @@ router.get('/api/:apiId', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
     const apiId = req.params.apiId;
-    const { days = 30, groupBy = 'day' } = req.query;
-    
+    const days = safeDays(req.query.days);
+    const { groupBy = 'day' } = req.query;
+
     // Verify API ownership
     const apiQuery = 'SELECT name FROM apis WHERE id = $1 AND user_id = $2';
     const apiResult = await pool.query(apiQuery, [apiId, userId]);
-    
+
     if (apiResult.rows.length === 0) {
       return res.status(404).json({
         success: false,
         message: 'API not found'
       });
     }
-    
+
     const apiName = apiResult.rows[0].name;
-    
+
     // Get overall statistics
     const statsQuery = `
       SELECT 
@@ -112,12 +125,12 @@ router.get('/api/:apiId', authenticateToken, async (req, res) => {
         COUNT(DISTINCT api_key_id) as unique_keys,
         COUNT(DISTINCT ip_address) as unique_ips
       FROM api_usage_logs
-      WHERE api_id = $1 AND created_at >= CURRENT_TIMESTAMP - INTERVAL '${parseInt(days)} days'
+      WHERE api_id = $1 AND created_at >= CURRENT_TIMESTAMP - MAKE_INTERVAL(days => $2)
     `;
-    
-    const statsResult = await pool.query(statsQuery, [apiId]);
+
+    const statsResult = await pool.query(statsQuery, [apiId, days]);
     const stats = statsResult.rows[0];
-    
+
     // Get time series data
     let dateFormat;
     switch (groupBy) {
@@ -133,7 +146,7 @@ router.get('/api/:apiId', authenticateToken, async (req, res) => {
       default:
         dateFormat = "DATE_TRUNC('day', created_at)";
     }
-    
+
     const timeSeriesQuery = `
       SELECT 
         ${dateFormat} as period,
@@ -143,13 +156,13 @@ router.get('/api/:apiId', authenticateToken, async (req, res) => {
         AVG(response_time) as avg_response_time,
         COUNT(DISTINCT api_key_id) as unique_keys
       FROM api_usage_logs
-      WHERE api_id = $1 AND created_at >= CURRENT_TIMESTAMP - INTERVAL '${parseInt(days)} days'
+      WHERE api_id = $1 AND created_at >= CURRENT_TIMESTAMP - MAKE_INTERVAL(days => $2)
       GROUP BY ${dateFormat}
       ORDER BY period DESC
     `;
-    
-    const timeSeriesResult = await pool.query(timeSeriesQuery, [apiId]);
-    
+
+    const timeSeriesResult = await pool.query(timeSeriesQuery, [apiId, days]);
+
     // Get top endpoints
     const endpointsQuery = `
       SELECT 
@@ -159,41 +172,41 @@ router.get('/api/:apiId', authenticateToken, async (req, res) => {
         COUNT(CASE WHEN status_code >= 400 THEN 1 END) as error_count,
         AVG(response_time) as avg_response_time
       FROM api_usage_logs
-      WHERE api_id = $1 AND created_at >= CURRENT_TIMESTAMP - INTERVAL '${parseInt(days)} days'
+      WHERE api_id = $1 AND created_at >= CURRENT_TIMESTAMP - MAKE_INTERVAL(days => $2)
       GROUP BY endpoint, method
       ORDER BY request_count DESC
       LIMIT 10
     `;
-    
-    const endpointsResult = await pool.query(endpointsQuery, [apiId]);
-    
+
+    const endpointsResult = await pool.query(endpointsQuery, [apiId, days]);
+
     // Get status code distribution
     const statusCodesQuery = `
       SELECT 
         status_code,
         COUNT(*) as count
       FROM api_usage_logs
-      WHERE api_id = $1 AND created_at >= CURRENT_TIMESTAMP - INTERVAL '${parseInt(days)} days'
+      WHERE api_id = $1 AND created_at >= CURRENT_TIMESTAMP - MAKE_INTERVAL(days => $2)
       GROUP BY status_code
       ORDER BY count DESC
     `;
-    
-    const statusCodesResult = await pool.query(statusCodesQuery, [apiId]);
-    
-    // Get geographic distribution (top countries by IP)
+
+    const statusCodesResult = await pool.query(statusCodesQuery, [apiId, days]);
+
+    // Get top IPs
     const geoQuery = `
       SELECT 
         ip_address,
         COUNT(*) as request_count
       FROM api_usage_logs
-      WHERE api_id = $1 AND created_at >= CURRENT_TIMESTAMP - INTERVAL '${parseInt(days)} days'
+      WHERE api_id = $1 AND created_at >= CURRENT_TIMESTAMP - MAKE_INTERVAL(days => $2)
       GROUP BY ip_address
       ORDER BY request_count DESC
       LIMIT 10
     `;
-    
-    const geoResult = await pool.query(geoQuery, [apiId]);
-    
+
+    const geoResult = await pool.query(geoQuery, [apiId, days]);
+
     res.json({
       success: true,
       data: {
@@ -244,7 +257,7 @@ router.get('/api/:apiId', authenticateToken, async (req, res) => {
         }))
       }
     });
-    
+
   } catch (error) {
     logger.error('Get API analytics error:', error);
     res.status(500).json({
@@ -258,7 +271,7 @@ router.get('/api/:apiId', authenticateToken, async (req, res) => {
 router.get('/realtime', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
-    
+
     // Get last hour statistics
     const realtimeQuery = `
       SELECT 
@@ -270,10 +283,10 @@ router.get('/realtime', authenticateToken, async (req, res) => {
       FROM api_usage_logs
       WHERE user_id = $1 AND created_at >= CURRENT_TIMESTAMP - INTERVAL '1 hour'
     `;
-    
+
     const realtimeResult = await pool.query(realtimeQuery, [userId]);
     const realtime = realtimeResult.rows[0];
-    
+
     // Get minute-by-minute data for the last hour
     const minutelyQuery = `
       SELECT 
@@ -287,18 +300,18 @@ router.get('/realtime', authenticateToken, async (req, res) => {
       ORDER BY minute DESC
       LIMIT 60
     `;
-    
+
     const minutelyResult = await pool.query(minutelyQuery, [userId]);
-    
+
     // Get current active sessions (based on recent activity)
     const activeSessionsQuery = `
       SELECT COUNT(DISTINCT ip_address) as active_sessions
       FROM api_usage_logs
       WHERE user_id = $1 AND created_at >= CURRENT_TIMESTAMP - INTERVAL '5 minutes'
     `;
-    
+
     const activeSessionsResult = await pool.query(activeSessionsQuery, [userId]);
-    
+
     res.json({
       success: true,
       data: {
@@ -319,7 +332,7 @@ router.get('/realtime', authenticateToken, async (req, res) => {
         }))
       }
     });
-    
+
   } catch (error) {
     logger.error('Get realtime analytics error:', error);
     res.status(500).json({
@@ -333,24 +346,25 @@ router.get('/realtime', authenticateToken, async (req, res) => {
 router.get('/errors', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
-    const { days = 7, apiId } = req.query;
-    
+    const days = safeDays(req.query.days, 7);
+    const { apiId } = req.query;
+
     let baseQuery = `
       FROM api_usage_logs aul
       JOIN apis a ON aul.api_id = a.id
       WHERE aul.user_id = $1 AND aul.status_code >= 400 
-        AND aul.created_at >= CURRENT_TIMESTAMP - INTERVAL '${parseInt(days)} days'
+        AND aul.created_at >= CURRENT_TIMESTAMP - MAKE_INTERVAL(days => $2)
     `;
-    
-    const queryParams = [userId];
-    let paramCount = 1;
-    
+
+    const queryParams = [userId, days];
+    let paramCount = 2;
+
     if (apiId) {
       paramCount++;
       baseQuery += ` AND aul.api_id = $${paramCount}`;
       queryParams.push(apiId);
     }
-    
+
     // Get error summary
     const errorSummaryQuery = `
       SELECT 
@@ -360,10 +374,10 @@ router.get('/errors', authenticateToken, async (req, res) => {
         COUNT(DISTINCT aul.ip_address) as affected_ips
       ${baseQuery}
     `;
-    
+
     const errorSummaryResult = await pool.query(errorSummaryQuery, queryParams);
     const errorSummary = errorSummaryResult.rows[0];
-    
+
     // Get error breakdown by status code
     const statusCodeQuery = `
       SELECT 
@@ -375,9 +389,9 @@ router.get('/errors', authenticateToken, async (req, res) => {
       GROUP BY aul.status_code
       ORDER BY error_count DESC
     `;
-    
+
     const statusCodeResult = await pool.query(statusCodeQuery, queryParams);
-    
+
     // Get top error endpoints
     const endpointErrorsQuery = `
       SELECT 
@@ -391,9 +405,9 @@ router.get('/errors', authenticateToken, async (req, res) => {
       ORDER BY error_count DESC
       LIMIT 10
     `;
-    
+
     const endpointErrorsResult = await pool.query(endpointErrorsQuery, queryParams);
-    
+
     // Get error timeline
     const errorTimelineQuery = `
       SELECT 
@@ -405,9 +419,9 @@ router.get('/errors', authenticateToken, async (req, res) => {
       ORDER BY hour DESC
       LIMIT 24
     `;
-    
+
     const errorTimelineResult = await pool.query(errorTimelineQuery, queryParams);
-    
+
     res.json({
       success: true,
       data: {
@@ -437,7 +451,7 @@ router.get('/errors', authenticateToken, async (req, res) => {
         }))
       }
     });
-    
+
   } catch (error) {
     logger.error('Get error analytics error:', error);
     res.status(500).json({

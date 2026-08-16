@@ -6,21 +6,24 @@ WORKDIR /app
 # Copy package files
 COPY package*.json ./
 
-# Install dependencies
-RUN npm ci --only=production
+# Install production dependencies
+RUN npm ci --only=production --no-audit --no-fund
 
 # Copy source code
 COPY . .
 
-# Create logs directory
-RUN mkdir -p logs
+# Create logs directory and make it writable by the app user
+RUN mkdir -p logs && chown -R node:node /app
+
+# Run as non-root user (principle of least privilege)
+USER node
 
 # Expose port
 EXPOSE 5000
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-  CMD curl -f http://localhost:5000/health || exit 1
+# Health check (busybox wget is included in alpine base)
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD wget -qO- http://127.0.0.1:5000/health || exit 1
 
 # Start the application
-CMD ["npm", "start"]
+CMD ["node", "index.js"]

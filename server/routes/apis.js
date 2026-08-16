@@ -64,11 +64,29 @@ const logAuditEvent = async (userId, action, resourceId, details, req) => {
   }
 };
 
-// Get all APIs for authenticated user
+/**
+ * @openapi
+ * /api/apis:
+ *   get:
+ *     summary: List APIs for the authenticated user
+ *     tags: [APIs]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - { name: page, in: query, schema: { type: integer } }
+ *       - { name: limit, in: query, schema: { type: integer, maximum: 100 } }
+ *       - { name: status, in: query, schema: { type: string, enum: [active, inactive, maintenance] } }
+ *     responses:
+ *       200:
+ *         description: Paginated list of APIs
+ */
 router.get('/', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
-    const { page = 1, limit = 10, status, search } = req.query;
+    // SECURITY: clamp pagination to prevent resource-exhaustion (LIMIT 999999999)
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 10));
+    const { status, search } = req.query;
     
     const offset = (page - 1) * limit;
     
@@ -213,7 +231,33 @@ router.get('/:id', authenticateToken, checkResourceOwnership('api'), async (req,
   }
 });
 
-// Create new API
+/**
+ * @openapi
+ * /api/apis:
+ *   post:
+ *     summary: Register a new upstream API
+ *     tags: [APIs]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [name, baseUrl]
+ *             properties:
+ *               name: { type: string }
+ *               baseUrl: { type: string, format: uri, description: SSRF-protected upstream base URL }
+ *               version: { type: string }
+ *               category: { type: string, enum: [REST, GraphQL] }
+ *               isPublic: { type: boolean }
+ *     responses:
+ *       201:
+ *         description: API registered
+ *       400:
+ *         description: Validation or SSRF rejection
+ */
 router.post('/', authenticateToken, createApiValidation, async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -255,6 +299,26 @@ router.post('/', authenticateToken, createApiValidation, async (req, res) => {
     const actualRateLimit = rateLimit !== undefined ? parseInt(rateLimit) : (rate_limit !== undefined ? parseInt(rate_limit) : 1000);
     const actualRateLimitWindow = rateLimitWindow !== undefined ? parseInt(rateLimitWindow) : (rate_limit_window !== undefined ? parseInt(rate_limit_window) : 3600);
     const actualCategory = category || 'REST';
+
+    // SECURITY: SSRF protection — validate the upstream base_url before storing.
+    // Prevents registering internal/cloud-metadata targets that the gateway
+    // would later proxy to (e.g. http://169.254.169.254).
+    const { validateUrl, isObviousInternal } = require('../utils/ssrf');
+    let baseHost;
+    try { baseHost = new URL(actualBaseUrl).hostname; } catch (urlErr) { baseHost = null; }
+    if (!baseHost || isObviousInternal(baseHost)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid base URL: internal or reserved targets are not allowed'
+      });
+    }
+    const ssrfCheck = await validateUrl(actualBaseUrl);
+    if (!ssrfCheck.ok) {
+      return res.status(400).json({
+        success: false,
+        message: `Invalid base URL: ${ssrfCheck.reason}`
+      });
+    }
 
     // Check if API name already exists for this user
     const existingApi = await pool.query(
@@ -360,6 +424,27 @@ router.put('/:id', authenticateToken, checkResourceOwnership('api'), updateApiVa
     const apiId = req.params.id;
     const userId = req.user.id;
     const updateFields = req.body;
+
+    // SECURITY: SSRF protection on base URL updates
+    const { validateUrl, isObviousInternal } = require('../utils/ssrf');
+    const newBaseUrl = updateFields.baseUrl || updateFields.endpoint;
+    if (newBaseUrl) {
+      let baseHost;
+      try { baseHost = new URL(newBaseUrl).hostname; } catch (urlErr) { baseHost = null; }
+      if (!baseHost || isObviousInternal(baseHost)) {
+        return res.status(400).json({
+          success: false,
+          message: 'Invalid base URL: internal or reserved targets are not allowed'
+        });
+      }
+      const ssrfCheck = await validateUrl(newBaseUrl);
+      if (!ssrfCheck.ok) {
+        return res.status(400).json({
+          success: false,
+          message: `Invalid base URL: ${ssrfCheck.reason}`
+        });
+      }
+    }
 
     // Check if name is being updated and doesn't conflict
     if (updateFields.name) {
@@ -537,7 +622,12 @@ router.delete('/:id', authenticateToken, checkResourceOwnership('api'), async (r
 router.get('/:id/stats', authenticateToken, checkResourceOwnership('api'), async (req, res) => {
   try {
     const apiId = req.params.id;
-    const { days = 7 } = req.query;
+    // SECURITY: clamp days and use parameterized MAKE_INTERVAL (was interpolated
+    // directly into SQL — allowed NaN crashes and unbounded windows)
+    const days = (() => {
+      const parsed = parseInt(req.query.days, 10);
+      return Number.isFinite(parsed) ? Math.max(1, Math.min(365, parsed)) : 7;
+    })();
 
     // Get usage statistics
     const usageQuery = `
@@ -549,12 +639,12 @@ router.get('/:id/stats', authenticateToken, checkResourceOwnership('api'), async
         AVG(response_time) as avg_response_time,
         COUNT(DISTINCT api_key_id) as unique_keys
       FROM api_usage_logs 
-      WHERE api_id = $1 AND created_at >= CURRENT_DATE - INTERVAL '${parseInt(days)} days'
+      WHERE api_id = $1 AND created_at >= CURRENT_DATE - MAKE_INTERVAL(days => $2)
       GROUP BY DATE(created_at)
       ORDER BY date DESC
     `;
 
-    const usageResult = await pool.query(usageQuery, [apiId]);
+    const usageResult = await pool.query(usageQuery, [apiId, days]);
 
     // Get top endpoints
     const endpointsQuery = `
@@ -564,13 +654,13 @@ router.get('/:id/stats', authenticateToken, checkResourceOwnership('api'), async
         COUNT(*) as request_count,
         AVG(response_time) as avg_response_time
       FROM api_usage_logs 
-      WHERE api_id = $1 AND created_at >= CURRENT_DATE - INTERVAL '${parseInt(days)} days'
+      WHERE api_id = $1 AND created_at >= CURRENT_DATE - MAKE_INTERVAL(days => $2)
       GROUP BY endpoint, method
       ORDER BY request_count DESC
       LIMIT 10
     `;
 
-    const endpointsResult = await pool.query(endpointsQuery, [apiId]);
+    const endpointsResult = await pool.query(endpointsQuery, [apiId, days]);
 
     // Get key usage statistics
     const keyUsageQuery = `
@@ -580,13 +670,13 @@ router.get('/:id/stats', authenticateToken, checkResourceOwnership('api'), async
         COUNT(aul.*) as request_count,
         MAX(aul.created_at) as last_used
       FROM api_keys ak
-      LEFT JOIN api_usage_logs aul ON ak.id = aul.api_key_id AND aul.created_at >= CURRENT_DATE - INTERVAL '${parseInt(days)} days'
+      LEFT JOIN api_usage_logs aul ON ak.id = aul.api_key_id AND aul.created_at >= CURRENT_DATE - MAKE_INTERVAL(days => $2)
       WHERE ak.api_id = $1
       GROUP BY ak.id, ak.name
       ORDER BY request_count DESC
     `;
 
-    const keyUsageResult = await pool.query(keyUsageQuery, [apiId]);
+    const keyUsageResult = await pool.query(keyUsageQuery, [apiId, days]);
 
     res.json({
       success: true,

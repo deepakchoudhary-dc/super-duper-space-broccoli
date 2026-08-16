@@ -1,15 +1,20 @@
 const { Pool } = require('pg');
+const config = require('./env');
 const logger = require('../utils/logger');
 
 const pool = new Pool({
-  host: process.env.DB_HOST || 'localhost',
-  port: parseInt(process.env.DB_PORT) || 5432,
-  database: process.env.DB_NAME || 'api_guardian',
-  user: process.env.DB_USER || 'postgres',
-  password: process.env.DB_PASSWORD || 'postgres',
-  max: 20,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 2000,
+  host: config.db.host,
+  port: config.db.port,
+  database: config.db.name,
+  user: config.db.user,
+  password: config.db.password,
+  max: config.db.poolMax,
+  idleTimeoutMillis: config.db.poolIdleTimeout,
+  connectionTimeoutMillis: config.db.poolConnectionTimeout,
+  // Emit errors instead of crashing the process on idle client errors
+  error: (err) => {
+    logger.error('Unexpected error on idle PostgreSQL client:', err);
+  }
 });
 
 const connectDB = async () => {
@@ -77,6 +82,9 @@ const createTables = async () => {
       permissions JSONB DEFAULT '{}',
       rate_limit INTEGER DEFAULT 1000,
       rate_limit_window INTEGER DEFAULT 3600,
+      burst_limit INTEGER DEFAULT 0,
+      hourly_limit INTEGER DEFAULT 0,
+      daily_limit INTEGER DEFAULT 0,
       status VARCHAR(20) DEFAULT 'active',
       expires_at TIMESTAMP,
       last_used TIMESTAMP,
@@ -139,8 +147,21 @@ const createTables = async () => {
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS failed_login_attempts INTEGER DEFAULT 0`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until TIMESTAMP`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMP`,
+    // apis — older databases lack columns the current code expects
+    `ALTER TABLE apis ADD COLUMN IF NOT EXISTS version VARCHAR(50) DEFAULT '1.0.0'`,
+    `ALTER TABLE apis ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'active'`,
+    `ALTER TABLE apis ADD COLUMN IF NOT EXISTS documentation_url VARCHAR(255)`,
+    `ALTER TABLE apis ADD COLUMN IF NOT EXISTS webhook_url VARCHAR(255)`,
+    `ALTER TABLE apis ADD COLUMN IF NOT EXISTS is_public BOOLEAN DEFAULT FALSE`,
+    `ALTER TABLE apis ADD COLUMN IF NOT EXISTS auth_required BOOLEAN DEFAULT TRUE`,
+    `ALTER TABLE apis ADD COLUMN IF NOT EXISTS rate_limit INTEGER DEFAULT 1000`,
+    `ALTER TABLE apis ADD COLUMN IF NOT EXISTS rate_limit_window INTEGER DEFAULT 3600`,
+    `ALTER TABLE apis ADD COLUMN IF NOT EXISTS category VARCHAR(50) DEFAULT 'REST'`,
     `ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS key_hash VARCHAR(255)`,
     `ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS key_prefix VARCHAR(20)`,
+    `ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS burst_limit INTEGER DEFAULT 0`,
+    `ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS hourly_limit INTEGER DEFAULT 0`,
+    `ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS daily_limit INTEGER DEFAULT 0`,
 
     // 3. Performance Indexes
     `CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)`,

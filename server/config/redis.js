@@ -1,5 +1,7 @@
 const redis = require('redis');
+const config = require('./env');
 const logger = require('../utils/logger');
+const metrics = require('../utils/metrics');
 
 let redisClient;
 
@@ -7,11 +9,10 @@ const connectRedis = async () => {
   // Skip Redis connection for development if Redis is not running
   try {
     redisClient = redis.createClient({
-      host: process.env.REDIS_HOST || 'localhost',
-      port: process.env.REDIS_PORT || 6379,
-      password: process.env.REDIS_PASSWORD || undefined,
+      url: `redis://${config.redis.host}:${config.redis.port}`,
+      password: config.redis.password || undefined,
       socket: {
-        connectTimeout: 2000,
+        connectTimeout: config.redis.connectTimeout,
         reconnectStrategy: false
       }
     });
@@ -22,10 +23,16 @@ const connectRedis = async () => {
 
     redisClient.on('connect', () => {
       logger.info('Redis connected successfully');
+      metrics.setRedisAvailable(true);
     });
 
     redisClient.on('disconnect', () => {
       logger.warn('Redis disconnected');
+      metrics.setRedisAvailable(false);
+    });
+
+    redisClient.on('error', (err) => {
+      metrics.setRedisAvailable(false);
     });
 
     // Try to connect with timeout
@@ -36,6 +43,7 @@ const connectRedis = async () => {
   } catch (error) {
     logger.warn('Redis connection failed, continuing without Redis:', error.message);
     redisClient = null;
+    metrics.setRedisAvailable(false);
     // Don't throw error, just continue without Redis
   }
 };
@@ -54,40 +62,9 @@ const isRedisAvailable = () => {
   return redisClient !== null && redisClient !== undefined && redisClient.isOpen;
 };
 
-// Rate limiting helpers
-const rateLimitKey = (identifier, window = 3600) => {
-  const windowStart = Math.floor(Date.now() / 1000 / window) * window;
-  return `rate_limit:${identifier}:${windowStart}`;
-};
-
-const checkRateLimit = async (identifier, limit = 1000, window = 3600) => {
-  if (!isRedisAvailable()) {
-    // Fail-open when Redis is down (configurable)
-    return { allowed: true, current: 0, limit, resetTime: 0 };
-  }
-
-  const key = rateLimitKey(identifier, window);
-  const current = await redisClient.get(key);
-  
-  if (current && parseInt(current) >= limit) {
-    return {
-      allowed: false,
-      current: parseInt(current),
-      limit,
-      resetTime: Math.floor(Date.now() / 1000 / window) * window + window
-    };
-  }
-
-  const newCount = await redisClient.incr(key);
-  await redisClient.expire(key, window);
-
-  return {
-    allowed: true,
-    current: newCount,
-    limit,
-    resetTime: Math.floor(Date.now() / 1000 / window) * window + window
-  };
-};
+// NOTE: Rate limiting now lives in utils/rateLimiter.js (atomic Redis Lua
+// sliding window + in-memory fallback). The racy GET-then-INCR fixed-window
+// implementation was removed to prevent accidental use.
 
 // Session management
 const setSession = async (sessionId, data, expiry = 86400) => {
@@ -270,7 +247,6 @@ module.exports = {
   getRedisClient,
   isRedisAvailable,
   connectRedis,
-  checkRateLimit,
   setSession,
   getSession,
   deleteSession,

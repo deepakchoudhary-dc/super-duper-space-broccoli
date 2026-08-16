@@ -5,25 +5,25 @@ const { URL } = require('url');
 const { v4: uuidv4 } = require('uuid');
 
 const { pool } = require('../config/database');
-const { 
-  authenticateApiKey, 
-  rateLimitMiddleware, 
-  checkApiPermissions 
+const {
+  authenticateApiKey,
+  rateLimitMiddleware,
 } = require('../middleware/auth');
-const { incrementUsage } = require('../config/redis');
+const { incrementUsage, getRedisClient } = require('../config/redis');
+const { hashApiKey, isValidKeyFormat } = require('../utils/crypto');
+const { wafMiddleware } = require('../utils/waf');
+const { validateUrl, isObviousInternal } = require('../utils/ssrf');
+const { getCircuitBreaker, getBreakerState } = require('../utils/circuitBreaker');
+const metrics = require('../utils/metrics');
+const config = require('../config/env');
 const logger = require('../utils/logger');
 
 const router = express.Router();
 
 // ============================================================================
-// PERSISTENT CONNECTION POOL (Fixes per-request proxy instantiation leak)
+// PERSISTENT CONNECTION POOL (keeps TCP sockets alive across requests)
 // ============================================================================
 
-/**
- * Singleton HTTP/HTTPS agent pool keyed by upstream base_url.
- * Reuses TCP connections across requests via Keep-Alive, eliminating
- * the socket churn and memory leak from creating proxies per-request.
- */
 const agentPool = new Map();
 
 const getAgent = (baseUrl) => {
@@ -37,64 +37,156 @@ const getAgent = (baseUrl) => {
   const agent = new AgentClass({
     keepAlive: true,
     keepAliveMsecs: 30000,
-    maxSockets: 50,
+    maxSockets: config.proxy.maxSockets,
     maxFreeSockets: 10,
-    timeout: 30000
+    timeout: config.proxy.connectTimeoutMs
   });
 
   agentPool.set(baseUrl, agent);
   return agent;
 };
 
-// Clean up agents on process exit
-process.on('SIGTERM', () => {
+// Clean up agents and circuit breakers on process exit
+const cleanup = () => {
   agentPool.forEach((agent) => agent.destroy());
   agentPool.clear();
-});
+  require('../utils/circuitBreaker').destroyAll();
+};
 
-process.on('SIGINT', () => {
-  agentPool.forEach((agent) => agent.destroy());
-  agentPool.clear();
-});
+process.on('SIGTERM', cleanup);
+process.on('SIGINT', cleanup);
 
 // ============================================================================
-// USAGE LOGGING MIDDLEWARE (Fixed: no res.end monkeypatching)
+// HEADER SANITIZATION — never leak internal/auth headers upstream
 // ============================================================================
 
 /**
- * Non-blocking API usage logger using res.on('finish') instead of
- * monkeypatching res.end(). This avoids:
- * - Memory exhaustion from buffering response bodies
- * - Broken streaming for chunked/SSE responses
- * - Event listener leaks
+ * SECURITY FIX: previously the proxy forwarded ALL request headers upstream,
+ * including `authorization` (the dashboard JWT), `cookie`, and the raw
+ * `X-API-Key`. A malicious upstream (or a compromised one) could harvest
+ * dashboard credentials. Only safe headers are forwarded.
  */
+const SENSITIVE_REQUEST_HEADERS = new Set([
+  'authorization',
+  'cookie',
+  'set-cookie',
+  'x-api-key',
+  'api_key',
+  'proxy-authorization',
+  'x-api-guardian-key',
+  'x-api-guardian-user',
+  'x-api-guardian-key-id'
+]);
+
+const HOP_BY_HOP_HEADERS = new Set([
+  'connection',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade'
+]);
+
+const FORWARDED_HEADERS = new Set([
+  'accept',
+  'accept-encoding',
+  'accept-language',
+  'cache-control',
+  'content-type',
+  'content-length',
+  'if-modified-since',
+  'if-none-match',
+  'range',
+  'referer',
+  'user-agent',
+  'x-requested-with',
+  'x-request-id',
+  'traceparent',
+  'tracestate',
+  'x-forwarded-for',
+  'origin',
+  'sec-ch-ua',
+  'sec-ch-ua-mobile',
+  'sec-ch-ua-platform',
+  'sec-fetch-dest',
+  'sec-fetch-mode',
+  'sec-fetch-site',
+  'sec-fetch-user',
+  'sec-websocket-key',
+  'sec-websocket-version',
+  'sec-websocket-protocol',
+  'sec-websocket-extensions'
+]);
+
+/**
+ * Build a sanitized header set to forward upstream.
+ */
+const buildForwardHeaders = (req, keyData) => {
+  const headers = {};
+
+  for (const [name, value] of Object.entries(req.headers)) {
+    const lower = name.toLowerCase();
+    if (HOP_BY_HOP_HEADERS.has(lower)) continue;
+    if (SENSITIVE_REQUEST_HEADERS.has(lower)) continue;
+    // Allowlist approach: forward known-safe headers + a couple of allowlisted custom ones
+    if (FORWARDED_HEADERS.has(lower) || lower.startsWith('x-api-guardian')) {
+      headers[lower] = value;
+    }
+  }
+
+  // Always set gateway metadata (never the raw key)
+  headers['x-api-guardian-key-id'] = keyData.id;
+  headers['x-api-guardian-user'] = keyData.user_id;
+  headers['x-forwarded-for'] = req.ip;
+  headers['x-real-ip'] = req.ip;
+  headers['x-request-id'] = req.requestId || uuidv4();
+
+  return headers;
+};
+
+// ============================================================================
+// PATH SANITIZATION — block traversal & encoded separators
+// ============================================================================
+
+const UNSAFE_PATH_PATTERN = /(\.\.\/|\.\.\\)|(%2e%2e)|(%2f)|(\\\\)|(\\\\?)/i;
+
+const assertSafePath = (path) => {
+  if (!path) return true;
+  return !UNSAFE_PATH_PATTERN.test(path);
+};
+
+// ============================================================================
+// USAGE LOGGING MIDDLEWARE (non-blocking, no body buffering)
+// ============================================================================
+
 const logApiUsage = (req, res, next) => {
   const startTime = Date.now();
-  
-  // Attach request ID for traceability
+
   req.requestId = req.headers['x-request-id'] || uuidv4();
   res.setHeader('X-Request-Id', req.requestId);
 
   res.on('finish', () => {
     const responseTime = Date.now() - startTime;
-    
+    metrics.observeHttp(req, res, responseTime);
+
     // Fire-and-forget async logging — never blocks the response
     (async () => {
       try {
         if (req.apiKey) {
           const usageQuery = `
             INSERT INTO api_usage_logs (
-              api_id, api_key_id, user_id, method, endpoint, 
+              api_id, api_key_id, user_id, method, endpoint,
               status_code, response_time, request_size, response_size,
               ip_address, user_agent, error_message
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
           `;
-          
+
           const requestSize = parseInt(req.get('content-length')) || 0;
-          // Get response size from header (no body buffering)
           const responseSize = parseInt(res.getHeader('content-length')) || 0;
           const errorMessage = res.statusCode >= 400 ? `HTTP ${res.statusCode}` : null;
-          
+
           await pool.query(usageQuery, [
             req.apiKey.api_id,
             req.apiKey.id,
@@ -109,22 +201,19 @@ const logApiUsage = (req, res, next) => {
             req.get('User-Agent'),
             errorMessage
           ]);
-          
-          // Update Redis usage stats
+
           try {
             await incrementUsage(req.apiKey.id, req.path);
           } catch (redisErr) {
             // Non-critical — Redis may be unavailable
           }
-          
-          // Update last_used timestamp
+
           await pool.query(
             'UPDATE api_keys SET last_used = CURRENT_TIMESTAMP WHERE id = $1',
             [req.apiKey.id]
           );
         }
-        
-        // Structured log entry
+
         logger.logApiUsage({
           requestId: req.requestId,
           apiId: req.apiKey?.api_id,
@@ -137,59 +226,59 @@ const logApiUsage = (req, res, next) => {
           ip: req.ip,
           userAgent: req.get('User-Agent')
         });
-        
       } catch (error) {
         logger.error('Failed to log API usage:', error);
       }
     })();
   });
-  
+
   next();
 };
 
 // ============================================================================
-// ENDPOINT PERMISSION VALIDATION
+// ENDPOINT PERMISSION VALIDATION (path + method against key grants)
 // ============================================================================
 
 const validateEndpointPermissions = (req, res, next) => {
   try {
     const { apiKey } = req;
-    
+
     if (!apiKey || !apiKey.permissions) {
       return res.status(403).json({
         success: false,
         message: 'No permissions defined for this API key'
       });
     }
-    
+
     const permissions = apiKey.permissions;
     const method = req.method.toLowerCase();
     const path = req.path;
-    
+
     let allowed = false;
-    
+
     if (permissions.endpoints) {
       for (const endpoint of permissions.endpoints) {
         const endpointPath = endpoint.path.replace(/\*/g, '.*');
         const pathRegex = new RegExp(`^${endpointPath}$`);
-        
+
         if (pathRegex.test(path) || endpoint.path === '*') {
-          if (endpoint.methods.includes(method) || endpoint.methods.includes('*')) {
+          // Methods may be stored upper/lower/mixed — compare case-insensitively
+          const allowedMethods = (endpoint.methods || []).map((m) => m.toLowerCase());
+          if (allowedMethods.includes(method) || allowedMethods.includes('*')) {
             allowed = true;
             break;
           }
         }
       }
     }
-    
+
     if (!allowed) {
       return res.status(403).json({
         success: false,
-        message: `Access denied: ${method.toUpperCase()} ${path} not allowed for this API key`,
-        permissions: permissions.endpoints
+        message: `Access denied: ${method.toUpperCase()} ${path} not allowed for this API key`
       });
     }
-    
+
     next();
   } catch (error) {
     logger.error('Permission validation error:', error);
@@ -201,72 +290,86 @@ const validateEndpointPermissions = (req, res, next) => {
 };
 
 // ============================================================================
-// STREAMING REVERSE PROXY (Zero-copy, persistent connections)
+// STREAMING REVERSE PROXY (zero-copy, persistent connections, circuit-aware)
 // ============================================================================
 
-/**
- * Forward request to upstream using persistent HTTP agents and stream.pipeline.
- * No response body buffering — streams directly between client and upstream.
- */
-const proxyRequest = (req, res, targetUrl, baseUrl) => {
+const proxyRequest = async (req, res, targetUrl, baseUrl) => {
+  // --- Circuit breaker: fail fast if the upstream is unhealthy ---
+  const breaker = getCircuitBreaker({
+    baseUrl,
+    apiId: req.apiKey.api_id,
+    healthPath: '/health'
+  });
+  breaker.startHealthCheck();
+
+  if (!breaker.allowRequest()) {
+    metrics.incrementCounter('gateway_upstream_failures_total', { api_id: req.apiKey.api_id });
+    return res.status(503).json({
+      success: false,
+      message: 'Service temporarily unavailable (upstream circuit open)'
+    });
+  }
+
+  // --- SSRF protection: re-validate resolved target before forwarding ---
+  const validation = await validateUrl(targetUrl);
+  if (!validation.ok) {
+    logger.logSecurityEvent('SSRF_BLOCKED', {
+      targetUrl,
+      reason: validation.reason,
+      ip: req.ip,
+      requestId: req.requestId
+    });
+    return res.status(400).json({
+      success: false,
+      message: 'Invalid upstream target'
+    });
+  }
+
   const url = new URL(targetUrl);
   const agent = getAgent(baseUrl);
   const httpModule = url.protocol === 'https:' ? https : http;
 
-  // Build upstream request options
   const options = {
     hostname: url.hostname,
     port: url.port || (url.protocol === 'https:' ? 443 : 80),
     path: url.pathname + url.search,
     method: req.method,
-    agent: agent,
-    headers: {
-      ...req.headers,
-      host: url.hostname,
-      'x-api-guardian-key': req.apiKey.id,
-      'x-api-guardian-user': req.user.id,
-      'x-forwarded-for': req.ip,
-      'x-real-ip': req.ip,
-      'x-request-id': req.requestId || uuidv4()
-    },
-    timeout: 30000
+    agent,
+    headers: buildForwardHeaders(req, req.apiKey),
+    timeout: config.proxy.connectTimeoutMs
   };
-
-  // Remove hop-by-hop headers that shouldn't be forwarded
-  delete options.headers['connection'];
-  delete options.headers['keep-alive'];
-  delete options.headers['transfer-encoding'];
 
   logger.debug('Proxying request', {
     requestId: req.requestId,
     originalUrl: req.originalUrl,
-    targetUrl: targetUrl,
+    targetUrl,
     method: req.method
   });
 
+  let succeeded = false;
+
   const proxyReq = httpModule.request(options, (proxyRes) => {
-    // Set response headers from upstream
+    succeeded = proxyRes.statusCode >= 200 && proxyRes.statusCode < 500;
+
+    // Response header transformation — strip leaky/internal headers, add security headers
     const responseHeaders = { ...proxyRes.headers };
-    
-    // Add CORS headers
+    delete responseHeaders['x-powered-by'];
+    delete responseHeaders['server'];
+    delete responseHeaders['connection'];
+    delete responseHeaders['keep-alive'];
+    delete responseHeaders['transfer-encoding'];
+
     responseHeaders['access-control-allow-origin'] = '*';
     responseHeaders['access-control-allow-methods'] = 'GET, POST, PUT, DELETE, PATCH, OPTIONS';
     responseHeaders['access-control-allow-headers'] = 'Content-Type, Authorization, X-API-Key';
-    
-    // Add API Guardian metadata headers
     responseHeaders['x-api-guardian-key-id'] = req.apiKey.id;
     responseHeaders['x-api-guardian-rate-limit'] = String(req.apiKey.rate_limit);
     responseHeaders['x-api-guardian-rate-window'] = String(req.apiKey.rate_limit_window);
     responseHeaders['x-request-id'] = req.requestId;
 
-    // Remove hop-by-hop headers from response
-    delete responseHeaders['connection'];
-    delete responseHeaders['keep-alive'];
-    delete responseHeaders['transfer-encoding'];
-
     res.writeHead(proxyRes.statusCode, responseHeaders);
 
-    // Stream response body directly — zero memory buffering
+    // Zero-copy streaming — no body buffering
     proxyRes.pipe(res);
 
     proxyRes.on('error', (err) => {
@@ -286,30 +389,36 @@ const proxyRequest = (req, res, targetUrl, baseUrl) => {
   });
 
   proxyReq.on('error', (err) => {
+    metrics.incrementCounter('gateway_upstream_failures_total', { api_id: req.apiKey.api_id });
     logger.error('Proxy request error:', {
       error: err.message,
       url: targetUrl,
       target: baseUrl,
       requestId: req.requestId
     });
-    
+
     if (!res.headersSent) {
       res.status(502).json({
         success: false,
         message: 'Bad Gateway - Unable to reach target API',
-        error: process.env.NODE_ENV === 'development' ? err.message : undefined
+        error: config.env === 'development' ? err.message : undefined
       });
     }
   });
 
   proxyReq.on('timeout', () => {
-    proxyReq.destroy();
+    proxyReq.destroy(new Error('timeout'));
     if (!res.headersSent) {
       res.status(504).json({
         success: false,
         message: 'Gateway Timeout - Target API did not respond in time'
       });
     }
+  });
+
+  // Record result for the circuit breaker when the response finishes
+  res.on('finish', () => {
+    breaker.recordResult(succeeded);
   });
 
   // Stream request body to upstream — zero-copy
@@ -320,15 +429,17 @@ const proxyRequest = (req, res, targetUrl, baseUrl) => {
 // PROXY ROUTE: /proxy/:userId/:apiId/*
 // ============================================================================
 
-router.use('/:userId/:apiId/*', 
+router.use(
+  '/:userId/:apiId/*',
   authenticateApiKey,
   rateLimitMiddleware,
+  wafMiddleware,
   validateEndpointPermissions,
   logApiUsage,
   (req, res) => {
     const { userId, apiId } = req.params;
     const targetPath = req.params[0] || '';
-    
+
     // Validate that the API key belongs to the correct API
     if (req.apiKey.api_id !== apiId) {
       return res.status(403).json({
@@ -336,7 +447,7 @@ router.use('/:userId/:apiId/*',
         message: 'API key does not belong to the specified API'
       });
     }
-    
+
     // Validate that the API belongs to the correct user
     if (req.user.id !== userId) {
       return res.status(403).json({
@@ -344,19 +455,265 @@ router.use('/:userId/:apiId/*',
         message: 'API key does not belong to the specified user'
       });
     }
-    
+
+    // Path traversal sanitization
+    if (!assertSafePath(targetPath)) {
+      logger.logSecurityEvent('PATH_TRAVERSAL_BLOCKED', {
+        targetPath,
+        ip: req.ip,
+        requestId: req.requestId
+      });
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid path'
+      });
+    }
+
+    // SSRF pre-check on the base URL (quick, synchronous)
+    const baseUrl = req.apiKey.base_url.replace(/\/+$/, '');
+    if (isObviousInternal(new URL(baseUrl).hostname)) {
+      logger.logSecurityEvent('SSRF_BLOCKED', {
+        baseUrl,
+        reason: 'obvious_internal_host',
+        ip: req.ip
+      });
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid upstream target'
+      });
+    }
+
     // Build target URL
-    const baseUrl = req.apiKey.base_url.replace(/\/+$/, ''); // Strip trailing slashes
-    const targetUrl = `${baseUrl}/${targetPath}${req.url.includes('?') ? '?' + req.url.split('?')[1] : ''}`;
-    
-    // Stream proxy request using persistent agent
-    proxyRequest(req, res, targetUrl, baseUrl);
+    const query = req.url.includes('?') ? req.url.split('?')[1] : '';
+    const targetUrl = `${baseUrl}/${targetPath}${query ? '?' + query : ''}`;
+
+    proxyRequest(req, res, targetUrl, baseUrl).catch((err) => {
+      logger.error('Proxy pipeline error:', err);
+      if (!res.headersSent) {
+        res.status(502).json({
+          success: false,
+          message: 'Bad Gateway'
+        });
+      }
+    });
   }
 );
 
 // ============================================================================
+// WEBSOCKET / SSE UPGRADE SUPPORT
+// ============================================================================
+
+/**
+ * Handle WebSocket upgrade requests to /proxy/:userId/:apiId/*.
+ * Registered on the HTTP server's 'upgrade' event in index.js.
+ *
+ * Security: API key is authenticated, rate limit checked, SSRF checked,
+ * and permission validated before the socket is bridged.
+ */
+const handleUpgrade = async (req, socket, head) => {
+  try {
+    const url = new URL(req.url, 'http://localhost');
+    if (!url.pathname.startsWith('/proxy/')) {
+      socket.destroy();
+      return;
+    }
+
+    // /proxy/:userId/:apiId/rest/of/path
+    const parts = url.pathname.split('/').filter(Boolean); // ['proxy', userId, apiId, ...rest]
+    if (parts.length < 3) {
+      socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    const [, userId, apiId] = parts;
+    const targetPath = parts.slice(3).join('/');
+
+    // Authenticate API key
+    const rawApiKey = req.headers['x-api-key'] || url.searchParams.get('api_key');
+    if (!rawApiKey || !isValidKeyFormat(rawApiKey)) {
+      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+
+    const keyHash = hashApiKey(rawApiKey);
+    const { getCachedApiKey } = require('../config/redis');
+    let keyData = await getCachedApiKey(keyHash);
+
+    if (!keyData) {
+      const keyQuery = `
+        SELECT ak.*, a.name as api_name, a.base_url, a.status as api_status, u.id as user_id
+        FROM api_keys ak
+        JOIN apis a ON ak.api_id = a.id
+        JOIN users u ON ak.user_id = u.id
+        WHERE ak.key_hash = $1 AND ak.status = 'active' AND a.status = 'active'
+      `;
+      const keyResult = await pool.query(keyQuery, [keyHash]);
+      if (keyResult.rows.length === 0) {
+        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+      keyData = keyResult.rows[0];
+    }
+
+    // Ownership + SSRF checks
+    if (keyData.api_id !== apiId || String(keyData.user_id) !== userId) {
+      socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+
+    const baseUrl = keyData.base_url.replace(/\/+$/, '');
+    if (isObviousInternal(new URL(baseUrl).hostname)) {
+      socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+
+    const validation = await validateUrl(`${baseUrl}/${targetPath}`);
+    if (!validation.ok) {
+      socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+
+    // Circuit breaker gate
+    const breaker = getCircuitBreaker({ baseUrl, apiId: keyData.api_id, healthPath: '/health' });
+    breaker.startHealthCheck();
+    if (!breaker.allowRequest()) {
+      socket.write('HTTP/1.1 503 Service Unavailable\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+
+    // Rate limit check
+    const { checkRateLimit } = require('../utils/rateLimiter');
+    const limitResult = await checkRateLimit(`api_key:${keyData.id}`, {
+      limit: keyData.rate_limit,
+      window: keyData.rate_limit_window
+    });
+    if (!limitResult.allowed) {
+      metrics.incrementRateLimitExceeded(keyData.id, limitResult.tier);
+      socket.write('HTTP/1.1 429 Too Many Requests\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+
+    proxyWebSocket(req, socket, head, `${baseUrl}/${targetPath}`, baseUrl, keyData);
+  } catch (error) {
+    logger.error('WebSocket upgrade error:', error);
+    try { socket.destroy(); } catch (err) { /* noop */ }
+  }
+};
+
+const proxyWebSocket = (req, socket, head, targetUrl, baseUrl, keyData) => {
+  const url = new URL(targetUrl);
+  const httpModule = url.protocol === 'https:' || url.protocol === 'wss:' ? https : http;
+  const agent = getAgent(baseUrl);
+
+  // Forward the client's upgrade headers verbatim (Sec-WebSocket-Key etc.)
+  const headers = {};
+  for (const [name, value] of Object.entries(req.headers)) {
+    const lower = name.toLowerCase();
+    if (HOP_BY_HOP_HEADERS.has(lower) || SENSITIVE_REQUEST_HEADERS.has(lower)) continue;
+    headers[lower] = value;
+  }
+  headers.host = url.hostname;
+  headers.connection = 'Upgrade';
+  headers.upgrade = 'websocket';
+  headers['x-api-guardian-key-id'] = keyData.id;
+  headers['x-request-id'] = req.requestId || uuidv4();
+
+  const options = {
+    hostname: url.hostname,
+    port: url.port || (url.protocol === 'wss:' || url.protocol === 'https:' ? 443 : 80),
+    path: url.pathname + url.search,
+    method: 'GET',
+    headers,
+    agent,
+    timeout: config.proxy.connectTimeoutMs
+  };
+
+  const upstreamReq = httpModule.request(options);
+
+  upstreamReq.on('upgrade', (res, upstreamSocket, upstreamHead) => {
+    logger.info('WebSocket upgraded', { targetUrl, keyId: keyData.id });
+    // Relay upstream 101 + headers to the client socket
+    const statusLine = `HTTP/1.1 101 ${res.statusMessage || 'Switching Protocols'}\r\n`;
+    let headerBlock = statusLine;
+    for (const [name, value] of Object.entries(res.headers)) {
+      const lower = name.toLowerCase();
+      if (HOP_BY_HOP_HEADERS.has(lower)) continue;
+      headerBlock += `${name}: ${value}\r\n`;
+    }
+    headerBlock += '\r\n';
+    socket.write(headerBlock);
+
+    if (upstreamHead && upstreamHead.length) {
+      upstreamSocket.unshift(upstreamHead);
+    }
+
+    // Bidirectional bridge
+    upstreamSocket.pipe(socket);
+    socket.pipe(upstreamSocket);
+
+    upstreamSocket.on('error', () => { try { socket.destroy(); } catch (err) { /* noop */ } });
+    socket.on('error', () => { try { upstreamSocket.destroy(); } catch (err) { /* noop */ } });
+    socket.on('close', () => { try { upstreamSocket.destroy(); } catch (err) { /* noop */ } });
+
+    // Record usage (fire and forget)
+    require('../utils/rateLimiter').checkRateLimit(`ws:${keyData.id}`, {
+      limit: keyData.rate_limit,
+      window: keyData.rate_limit_window
+    }).catch(() => {});
+  });
+
+  upstreamReq.on('error', (err) => {
+    logger.error('WebSocket proxy error:', { error: err.message, targetUrl });
+    try { socket.destroy(); } catch (e) { /* noop */ }
+  });
+
+  upstreamReq.on('timeout', () => {
+    upstreamReq.destroy(new Error('timeout'));
+    try { socket.destroy(); } catch (e) { /* noop */ }
+  });
+
+  // If there's buffered data in `head`, forward it after upgrade request
+  if (head && head.length) {
+    upstreamReq.write(head);
+  }
+  upstreamReq.end();
+};
+
+// ============================================================================
 // UTILITY ENDPOINTS
 // ============================================================================
+
+/**
+ * @openapi
+ * /proxy/{userId}/{apiId}/{path}:
+ *   get:
+ *     summary: Proxy a request to a registered upstream API
+ *     tags: [Proxy]
+ *     security:
+ *       - apiKeyAuth: []
+ *     parameters:
+ *       - { name: userId, in: path, required: true, schema: { type: string } }
+ *       - { name: apiId, in: path, required: true, schema: { type: string } }
+ *       - { name: path, in: path, required: true, schema: { type: string } }
+ *     responses:
+ *       200:
+ *         description: Upstream response (streamed)
+ *       401:
+ *         description: Missing or invalid API key
+ *       429:
+ *         description: Rate limit exceeded
+ *       502:
+ *         description: Upstream unreachable
+ *       503:
+ *         description: Upstream circuit open
+ */
 
 // Health check
 router.get('/health', (req, res) => {
@@ -369,41 +726,41 @@ router.get('/health', (req, res) => {
 });
 
 // Proxy statistics
-router.get('/stats', authenticateApiKey, async (req, res) => {
+router.get('/stats', authenticateApiKey, rateLimitMiddleware, async (req, res) => {
   try {
     const { apiKey } = req;
-    const { days = 7 } = req.query;
+    const days = (() => {
+      const parsed = parseInt(req.query.days, 10);
+      return Number.isFinite(parsed) ? Math.max(1, Math.min(365, parsed)) : 7;
+    })();
 
-    // Sanitize days parameter
-    const safeDays = Math.max(1, Math.min(365, parseInt(days) || 7));
-    
     const statsQuery = `
-      SELECT 
+      SELECT
         COUNT(*) as total_requests,
         COUNT(CASE WHEN status_code >= 200 AND status_code < 300 THEN 1 END) as successful_requests,
         COUNT(CASE WHEN status_code >= 400 THEN 1 END) as error_requests,
         AVG(response_time) as avg_response_time,
         MIN(created_at) as first_request,
         MAX(created_at) as last_request
-      FROM api_usage_logs 
+      FROM api_usage_logs
       WHERE api_key_id = $1 AND created_at >= CURRENT_TIMESTAMP - MAKE_INTERVAL(days => $2)
     `;
-    
-    const statsResult = await pool.query(statsQuery, [apiKey.id, safeDays]);
+
+    const statsResult = await pool.query(statsQuery, [apiKey.id, days]);
     const stats = statsResult.rows[0];
-    
+
     const hourlyQuery = `
-      SELECT 
+      SELECT
         DATE_TRUNC('hour', created_at) as hour,
         COUNT(*) as requests
-      FROM api_usage_logs 
+      FROM api_usage_logs
       WHERE api_key_id = $1 AND created_at >= CURRENT_TIMESTAMP - INTERVAL '24 hours'
       GROUP BY DATE_TRUNC('hour', created_at)
       ORDER BY hour DESC
     `;
-    
+
     const hourlyResult = await pool.query(hourlyQuery, [apiKey.id]);
-    
+
     res.json({
       success: true,
       data: {
@@ -428,7 +785,7 @@ router.get('/stats', authenticateApiKey, async (req, res) => {
         }
       }
     });
-    
+
   } catch (error) {
     logger.error('Get proxy stats error:', error);
     res.status(500).json({
@@ -439,7 +796,7 @@ router.get('/stats', authenticateApiKey, async (req, res) => {
 });
 
 // Test endpoint for API key validation
-router.get('/test', authenticateApiKey, (req, res) => {
+router.get('/test', authenticateApiKey, rateLimitMiddleware, (req, res) => {
   res.json({
     success: true,
     message: 'API key is valid and working',
@@ -457,6 +814,18 @@ router.get('/test', authenticateApiKey, (req, res) => {
   });
 });
 
+// Circuit breaker status (admin diagnostic)
+router.get('/circuit-breakers', authenticateApiKey, (req, res) => {
+  const { getBreakerState } = require('../utils/circuitBreaker');
+  res.json({
+    success: true,
+    data: {
+      upstream: req.apiKey.base_url,
+      state: getBreakerState(req.apiKey.base_url)
+    }
+  });
+});
+
 // CORS preflight
 router.options('*', (req, res) => {
   res.header('Access-Control-Allow-Origin', '*');
@@ -467,3 +836,4 @@ router.options('*', (req, res) => {
 });
 
 module.exports = router;
+module.exports.handleUpgrade = handleUpgrade;
