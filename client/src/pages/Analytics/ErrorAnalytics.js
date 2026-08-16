@@ -21,22 +21,17 @@ import {
   TablePagination,
   Collapse,
   IconButton,
-  Alert,
-  Tooltip,
   TextField
 } from '@mui/material';
 import {
   Error,
-  Warning,
   ExpandMore,
   ExpandLess,
   Search,
-  FilterList,
   Download,
   Refresh,
   Timeline,
   BugReport,
-  Code,
   AccessTime
 } from '@mui/icons-material';
 import { DateTimePicker } from '@mui/x-date-pickers/DateTimePicker';
@@ -112,6 +107,7 @@ const ErrorAnalytics = () => {
 
   useEffect(() => {
     fetchErrorData();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dateRange, filters]);
 
   const fetchErrorData = async () => {

@@ -1,7 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import {
   Container,
-  Paper,
   Grid,
   TextField,
   Button,
@@ -36,21 +35,20 @@ import {
   VpnKey,
   Smartphone,
   Delete,
-  Add,
   Visibility,
   VisibilityOff,
-  Warning,
-  CheckCircle,
   LocationOn,
   Computer,
-  Phone
+  Phone,
+  Check,
+  RadioButtonUnchecked
 } from '@mui/icons-material';
 import { QRCodeSVG } from 'qrcode.react';
 import { useAuth } from '../../contexts/AuthContext';
 import api from '../../services/api';
 
 const SecuritySettings = () => {
-  const { user } = useAuth();
+  useAuth();
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
@@ -383,7 +381,8 @@ const SecuritySettings = () => {
                           fontSize: '0.8rem'
                         }}
                       >
-                        {req.met ? '✓' : '○'} {req.text}
+                        {req.met ? <Check sx={{ fontSize: '0.8rem', verticalAlign: 'middle' }} /> : <RadioButtonUnchecked sx={{ fontSize: '0.8rem', verticalAlign: 'middle' }} />}{' '}
+                        {req.text}
                       </Typography>
                     ))}
                   </Box>

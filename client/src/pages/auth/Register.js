@@ -1,7 +1,5 @@
 import React, { useState } from 'react';
 import {
-  Container,
-  Paper,
   TextField,
   Button,
   Typography,
@@ -23,7 +21,9 @@ import {
   Lock,
   Person,
   Google,
-  GitHub
+  GitHub,
+  Security,
+  CheckCircle
 } from '@mui/icons-material';
 import { Link as RouterLink, useNavigate } from 'react-router-dom';
 import { useAuth } from '../../contexts/AuthContext';
@@ -113,7 +113,7 @@ const Register = () => {  const [formData, setFormData] = useState({
       <Box sx={{ width: '100%', display: 'flex', flexDirection: 'column' }}>
             <Box sx={{ textAlign: 'center' }}>
               <Typography variant="h3" sx={{ mb: 2, color: 'success.main' }}>
-                ✅
+                <CheckCircle sx={{ fontSize: '3rem' }} />
               </Typography>
               <Typography variant="h5" gutterBottom>
                 Registration Successful!
@@ -136,8 +136,8 @@ const Register = () => {  const [formData, setFormData] = useState({
   return (
     <Box sx={{ width: '100%', display: 'flex', flexDirection: 'column' }}>
           <Box sx={{ textAlign: 'center', mb: 3 }}>
-            <Typography variant="h3" sx={{ mb: 1, fontWeight: 'bold' }}>
-              🛡️
+            <Typography variant="h3" sx={{ mb: 1, fontWeight: 'bold', color: 'primary.main' }}>
+              <Security sx={{ fontSize: '3rem' }} />
             </Typography>
             <Typography variant="h4" component="h1" gutterBottom>
               Create Account
@@ -317,6 +317,10 @@ const Register = () => {  const [formData, setFormData] = useState({
                 variant="outlined"
                 startIcon={<Google />}
                 sx={{ py: 1 }}
+                onClick={() => {
+                  const base = process.env.REACT_APP_API_URL || 'http://localhost:5000';
+                  window.location.href = `${base}/api/auth/oidc/authorize`;
+                }}
               >
                 Google
               </Button>
@@ -325,6 +329,10 @@ const Register = () => {  const [formData, setFormData] = useState({
                 variant="outlined"
                 startIcon={<GitHub />}
                 sx={{ py: 1 }}
+                onClick={() => {
+                  const base = process.env.REACT_APP_API_URL || 'http://localhost:5000';
+                  window.location.href = `${base}/api/auth/oidc/authorize`;
+                }}
               >
                 GitHub
               </Button>

@@ -23,7 +23,6 @@ import {
   TableContainer,
   TableHead,
   TableRow,
-  TextField,
   Tab,
   Tabs
 } from '@mui/material';
@@ -34,12 +33,7 @@ import {
   Download,
   Launch,
   Code as CodeIcon,
-  Api as ApiIcon,
-  Security,
-  Speed,
-  CheckCircle,
-  Error,
-  Warning
+  Api as ApiIcon
 } from '@mui/icons-material';
 import { useParams, useNavigate } from 'react-router-dom';
 import { toast } from 'react-toastify';
@@ -57,6 +51,7 @@ const APIDocumentation = () => {
     if (id) {
       fetchAPIDetails();
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
 
   const fetchAPIDetails = async () => {

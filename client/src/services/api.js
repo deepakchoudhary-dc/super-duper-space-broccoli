@@ -155,7 +155,24 @@ export const keyAPI = {
   delete: (id) => api.delete(`/api/keys/${id}`),
   revoke: (id) => api.post(`/api/keys/${id}/revoke`),
   regenerate: (id) => api.post(`/api/keys/${id}/regenerate`),
+  // Phase B: rotate with optional grace period (old key stays valid briefly)
+  rotate: (id, data) => api.post(`/api/keys/${id}/rotate`, data),
   getUsage: (id, params) => api.get(`/api/keys/${id}/usage`, { params }),
+};
+
+export const orgAPI = {
+  getAll: () => api.get('/api/orgs'),
+  getById: (id) => api.get(`/api/orgs/${id}`),
+  create: (data) => api.post('/api/orgs', data),
+  addMember: (orgId, data) => api.post(`/api/orgs/${orgId}/members`, data),
+  updateMemberRole: (orgId, userId, data) => api.patch(`/api/orgs/${orgId}/members/${userId}`, data),
+  removeMember: (orgId, userId) => api.delete(`/api/orgs/${orgId}/members/${userId}`),
+  delete: (orgId) => api.delete(`/api/orgs/${orgId}`),
+};
+
+export const adminAPI = {
+  // Immutable audit trail (admin only)
+  getAuditLogs: (params) => api.get('/api/admin/audit-logs', { params }),
 };
 
 export const analyticsAPI = {

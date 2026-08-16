@@ -18,6 +18,7 @@
  */
 
 const logger = require('./logger');
+const { recordEvent } = require('./tracing');
 const config = require('../config/env');
 
 // Regex library — grouped by category for audit clarity
@@ -108,6 +109,13 @@ const wafMiddleware = (req, res, next) => {
   for (const input of inputs) {
     const hit = scan(input);
     if (hit) {
+      recordEvent('waf.block', {
+        category: hit.category,
+        severity: hit.severity,
+        path: req.originalUrl,
+        method: req.method
+      });
+
       logger.logSecurityEvent('WAF_BLOCKED', {
         category: hit.category,
         severity: hit.severity,
@@ -117,11 +125,44 @@ const wafMiddleware = (req, res, next) => {
         requestId: req.requestId
       });
 
+      // Immutable audit trail for every blocked payload
+      require('./audit').audit({
+        userId: req.apiKey ? req.apiKey.user_id : null,
+        action: 'SECURITY_WAF_BLOCK',
+        resourceType: 'security',
+        resourceId: req.apiKey ? req.apiKey.id : null,
+        details: {
+          category: hit.category,
+          severity: hit.severity,
+          path: req.originalUrl,
+          method: req.method,
+          ip: req.ip
+        },
+        req
+      });
+
       if (req.apiKey) {
         // Count blocked requests against the key via metrics
         require('./metrics').incrementCounter('gateway_waf_blocked_total', {
           category: hit.category
         });
+
+        // Alert the key owner (cooldown-throttled, fire-and-forget)
+        require('./alerts').notifySecurityAlert(
+          req.apiKey.user_id,
+          'WAF blocked a request',
+          {
+            category: hit.category,
+            severity: hit.severity,
+            path: req.originalUrl,
+            method: req.method,
+            ip: req.ip,
+            keyId: req.apiKey.id,
+            keyName: req.apiKey.name,
+            apiId: req.apiKey.api_id,
+            timestamp: new Date().toISOString()
+          }
+        ).catch(() => {});
       }
 
       return res.status(400).json({

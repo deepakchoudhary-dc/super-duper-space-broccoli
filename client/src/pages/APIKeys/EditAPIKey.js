@@ -10,12 +10,9 @@ import {
   InputLabel,
   Select,
   MenuItem,
-  Switch,
-  FormControlLabel,
   Chip,
   IconButton,
   Divider,
-  Alert,
   Card,
   CardContent,
   List,
@@ -23,20 +20,13 @@ import {
   ListItemText,
   ListItemIcon,
   Checkbox,
-  DatePicker,
   Skeleton
 } from '@mui/material';
 import {
   ArrowBack,
   Save,
   Add,
-  Delete,
-  Security,
-  Speed,
-  Visibility,
-  Key,
-  Help,
-  CalendarToday
+  Help
 } from '@mui/icons-material';
 import { LocalizationProvider } from '@mui/x-date-pickers/LocalizationProvider';
 import { AdapterDayjs } from '@mui/x-date-pickers/AdapterDayjs';
@@ -58,6 +48,9 @@ const EditAPIKey = () => {
     apiId: '',
     rateLimit: 1000,
     rateLimitWindow: 60,
+    burstLimit: 0,
+    hourlyLimit: 0,
+    dailyLimit: 0,
     expiresAt: null,
     permissions: [],
     allowedIps: [],
@@ -78,6 +71,7 @@ const EditAPIKey = () => {
       fetchAPIKeyDetails();
       fetchAPIs();
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
 
   const fetchAPIKeyDetails = async () => {
@@ -91,6 +85,9 @@ const EditAPIKey = () => {
         apiId: keyData.apiId || '',
         rateLimit: keyData.rateLimit || 1000,
         rateLimitWindow: keyData.rateLimitWindow || 60,
+        burstLimit: keyData.burstLimit || 0,
+        hourlyLimit: keyData.hourlyLimit || 0,
+        dailyLimit: keyData.dailyLimit || 0,
         expiresAt: keyData.expiresAt ? dayjs(keyData.expiresAt) : null,
         permissions: Array.isArray(keyData.permissions) ? keyData.permissions : [],
         allowedIps: Array.isArray(keyData.allowedIps) ? keyData.allowedIps : [],
@@ -329,6 +326,42 @@ const EditAPIKey = () => {
                       onChange={handleInputChange('rateLimitWindow')}
                       helperText="Time window for rate limiting"
                       inputProps={{ min: 1 }}
+                    />
+                  </Grid>
+
+                  <Grid item xs={12} sm={4}>
+                    <TextField
+                      fullWidth
+                      label="Burst (per second)"
+                      type="number"
+                      value={formData.burstLimit}
+                      onChange={handleInputChange('burstLimit')}
+                      helperText="0 = off"
+                      inputProps={{ min: 0 }}
+                    />
+                  </Grid>
+
+                  <Grid item xs={12} sm={4}>
+                    <TextField
+                      fullWidth
+                      label="Hourly cap"
+                      type="number"
+                      value={formData.hourlyLimit}
+                      onChange={handleInputChange('hourlyLimit')}
+                      helperText="0 = off"
+                      inputProps={{ min: 0 }}
+                    />
+                  </Grid>
+
+                  <Grid item xs={12} sm={4}>
+                    <TextField
+                      fullWidth
+                      label="Daily cap"
+                      type="number"
+                      value={formData.dailyLimit}
+                      onChange={handleInputChange('dailyLimit')}
+                      helperText="0 = off"
+                      inputProps={{ min: 0 }}
                     />
                   </Grid>
                 </Grid>

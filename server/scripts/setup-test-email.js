@@ -44,12 +44,12 @@ async function setupTestEmail() {
     
     fs.writeFileSync(envPath, envContent);
     
-    console.log('✅ .env file updated with test email credentials');
-    console.log('📧 You can preview sent emails at: https://ethereal.email');
-    console.log('🔗 Use the test account credentials above to log in and view emails');
+    console.log('.env file updated with test email credentials');
+    console.log('You can preview sent emails at: https://ethereal.email');
+    console.log('Use the test account credentials above to log in and view emails');
     
   } catch (error) {
-    console.error('❌ Failed to setup test email:', error.message);
+    console.error('Failed to setup test email:', error.message);
   }
 }
 

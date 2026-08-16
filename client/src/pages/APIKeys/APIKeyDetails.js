@@ -17,7 +17,6 @@ import {
   Tab,
   Tabs,
   Alert,
-  Tooltip,
   Menu,
   MenuItem,
   Table,
@@ -25,14 +24,17 @@ import {
   TableCell,
   TableContainer,
   TableHead,
-  TableRow
+  TableRow,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogActions,
+  TextField
 } from '@mui/material';
 import {
   ArrowBack,
   Edit,
   Delete,
-  Settings,
-  Key,
   Security,
   Speed,
   Visibility,
@@ -68,6 +70,7 @@ const APIKeyDetails = () => {
       fetchAnalytics();
       fetchUsageLogs();
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
 
   const fetchAPIKeyDetails = async () => {
@@ -159,6 +162,29 @@ const APIKeyDetails = () => {
     } catch (error) {
       console.error('Error regenerating API key:', error);
       toast.error('Failed to regenerate API key');
+    }
+  };
+
+  // Phase B: rotate with an optional grace period — the old key keeps working
+  // for a short window so consumers can roll over without an outage.
+  const [rotateDialog, setRotateDialog] = useState(false);
+  const [graceMinutes, setGraceMinutes] = useState(0);
+  const [rotating, setRotating] = useState(false);
+
+  const handleRotate = async () => {
+    try {
+      setRotating(true);
+      const response = await keyAPI.rotate(id, {
+        gracePeriodMinutes: parseInt(graceMinutes, 10) || 0
+      });
+      setApiKey({ ...apiKey, key: response.data.data.key.apiKey });
+      setRotateDialog(false);
+      toast.success('API key rotated successfully');
+    } catch (error) {
+      console.error('Error rotating API key:', error);
+      toast.error(error.response?.data?.message || 'Failed to rotate API key');
+    } finally {
+      setRotating(false);
     }
   };
 
@@ -405,6 +431,14 @@ const APIKeyDetails = () => {
                     Regenerate Key
                   </Button>
                   <Button
+                    variant="outlined"
+                    color="warning"
+                    onClick={() => setRotateDialog(true)}
+                    sx={{ mr: 1 }}
+                  >
+                    Rotate Key
+                  </Button>
+                  <Button
                     variant={apiKey.status === 'active' ? 'outlined' : 'contained'}
                     color={apiKey.status === 'active' ? 'error' : 'success'}
                     onClick={handleToggleStatus}
@@ -511,6 +545,43 @@ const APIKeyDetails = () => {
         </Card>
       )}
 
+      {/* Rotate Key Dialog */}
+      <Dialog
+        open={rotateDialog}
+        onClose={() => setRotateDialog(false)}
+        maxWidth="xs"
+        fullWidth
+      >
+        <DialogTitle>Rotate API Key</DialogTitle>
+        <DialogContent>
+          <Typography variant="body2" sx={{ mb: 2 }}>
+            Rotation issues a new key and revokes the old one. The old key is
+            rejected immediately unless you grant a grace period for consumers
+            to roll over.
+          </Typography>
+          <TextField
+            fullWidth
+            label="Grace period (minutes)"
+            type="number"
+            value={graceMinutes}
+            onChange={(e) => setGraceMinutes(e.target.value)}
+            inputProps={{ min: 0, max: 1440 }}
+            helperText="0 = immediate revocation"
+          />
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setRotateDialog(false)}>Cancel</Button>
+          <Button
+            variant="contained"
+            color="warning"
+            onClick={handleRotate}
+            disabled={rotating}
+          >
+            {rotating ? 'Rotating...' : 'Rotate Key'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
       {/* Actions Menu */}
       <Menu
         anchorEl={anchorEl}
@@ -524,6 +595,10 @@ const APIKeyDetails = () => {
         <MenuItem onClick={handleRegenerateKey}>
           <Refresh sx={{ mr: 1 }} fontSize="small" />
           Regenerate Key
+        </MenuItem>
+        <MenuItem onClick={() => setRotateDialog(true)}>
+          <Refresh sx={{ mr: 1 }} fontSize="small" color="warning" />
+          Rotate Key
         </MenuItem>
         <MenuItem onClick={() => handleToggleStatus()}>
           {apiKey.status === 'active' ? (

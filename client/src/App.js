@@ -16,6 +16,7 @@ import ForgotPassword from './pages/auth/ForgotPassword';
 import ResetPassword from './pages/auth/ResetPassword';
 import VerifyEmail from './pages/auth/VerifyEmail';
 import TwoFactorAuth from './pages/auth/TwoFactorAuth';
+import OIDCCallback from './pages/auth/OIDCCallback';
 
 // Dashboard pages
 import Dashboard from './pages/dashboard/Dashboard';
@@ -46,6 +47,13 @@ import APIDocumentation from './pages/Documentation/APIDocumentation';
 
 // Settings pages
 import Settings from './pages/Settings/Settings';
+
+// Organizations pages (Phase C multi-tenancy UI)
+import Organizations from './pages/Organizations/Organizations';
+import OrgDetails from './pages/Organizations/OrgDetails';
+
+// Admin pages (Phase C audit trail)
+import AuditLogs from './pages/Admin/AuditLogs';
 
 // Error pages
 import NotFound from './pages/Error/NotFound';
@@ -172,6 +180,9 @@ function App() {
             </AuthLayout>
           </PublicRoute>
         } />
+        
+        {/* OIDC single sign-on callback (public — tokens arrive in the fragment) */}
+        <Route path="/oidc/callback" element={<OIDCCallback />} />
 
         {/* Protected routes */}
         <Route path="/dashboard" element={
@@ -311,6 +322,32 @@ function App() {
           <ProtectedRoute>
             <Layout>
               <APIDocumentation />
+            </Layout>
+          </ProtectedRoute>
+        } />
+
+        {/* Organizations routes */}
+        <Route path="/orgs" element={
+          <ProtectedRoute>
+            <Layout>
+              <Organizations />
+            </Layout>
+          </ProtectedRoute>
+        } />
+        
+        <Route path="/orgs/:id" element={
+          <ProtectedRoute>
+            <Layout>
+              <OrgDetails />
+            </Layout>
+          </ProtectedRoute>
+        } />
+
+        {/* Admin routes */}
+        <Route path="/admin/audit" element={
+          <ProtectedRoute>
+            <Layout>
+              <AuditLogs />
             </Layout>
           </ProtectedRoute>
         } />

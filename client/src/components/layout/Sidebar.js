@@ -20,7 +20,8 @@ import {
   Settings,
   Person,
   Security,
-  Notifications
+  Group,
+  Lock
 } from '@mui/icons-material';
 import { useNavigate, useLocation } from 'react-router-dom';
 
@@ -46,7 +47,14 @@ const Sidebar = ({ mobileOpen, onDrawerToggle }) => {
       items: [
         { label: 'Profile', icon: <Person />, path: '/profile' },
         { label: 'Security', icon: <Security />, path: '/profile/security' },
+        { label: 'Organizations', icon: <Group />, path: '/orgs' },
         { label: 'Settings', icon: <Settings />, path: '/settings' },
+      ]
+    },
+    {
+      section: 'Admin',
+      items: [
+        { label: 'Audit Log', icon: <Lock />, path: '/admin/audit' },
       ]
     }
   ];
@@ -62,8 +70,9 @@ const Sidebar = ({ mobileOpen, onDrawerToggle }) => {
     <div>
       <Toolbar>
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, width: '100%' }}>
-          <Typography variant="h6" sx={{ fontWeight: 'bold', color: 'primary.main' }}>
-            🛡️ Guardian
+          <Typography variant="h6" sx={{ fontWeight: 'bold', color: 'primary.main', display: 'flex', alignItems: 'center', gap: 1 }}>
+            <Security fontSize="small" color="primary" />
+            Guardian
           </Typography>
         </Box>
       </Toolbar>

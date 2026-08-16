@@ -1,0 +1,66 @@
+# Redis High-Availability topology — 3 Redis nodes + 3 Sentinels.
+#
+# The gateway treats Redis as optional (graceful degradation + in-memory
+# fallback), but when Redis carries rate-limit state, cache, and token
+# blacklists, HA prevents state loss during a node failure.
+#
+#   docker compose -f scripts/ops/redis-ha/docker-compose.yml up -d
+#
+# Topology:
+#   redis-1 (primary, initially)   redis-2, redis-3 (replicas)
+#   sentinel-1..3 — monitor the primary and auto-promote a replica on failure
+#
+# Point the gateway at Sentinel hosts and let it discover the current primary:
+#   REDIS_HOST=redis-1 REDIS_PORT=26379 ... (or via the sentinel discovery helper)
+
+services:
+  redis-1:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-redispass}
+    networks: [redis-ha]
+
+  redis-2:
+    image: redis:7-alpine
+    command: >
+      redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-redispass}
+      --slaveof redis-1 6379 --masterauth ${REDIS_PASSWORD:-redispass}
+    networks: [redis-ha]
+    depends_on: [redis-1]
+
+  redis-3:
+    image: redis:7-alpine
+    command: >
+      redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-redispass}
+      --slaveof redis-1 6379 --masterauth ${REDIS_PASSWORD:-redispass}
+    networks: [redis-ha]
+    depends_on: [redis-1]
+
+  sentinel-1:
+    image: redis:7-alpine
+    command: >
+      redis-sentinel /etc/sentinel.conf
+    volumes:
+      - ./sentinel-1.conf:/etc/sentinel.conf
+    networks: [redis-ha]
+    depends_on: [redis-1, redis-2, redis-3]
+
+  sentinel-2:
+    image: redis:7-alpine
+    command: >
+      redis-sentinel /etc/sentinel.conf
+    volumes:
+      - ./sentinel-2.conf:/etc/sentinel.conf
+    networks: [redis-ha]
+    depends_on: [redis-1, redis-2, redis-3]
+
+  sentinel-3:
+    image: redis:7-alpine
+    command: >
+      redis-sentinel /etc/sentinel.conf
+    volumes:
+      - ./sentinel-3.conf:/etc/sentinel.conf
+    networks: [redis-ha]
+    depends_on: [redis-1, redis-2, redis-3]
+
+networks:
+  redis-ha:

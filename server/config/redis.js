@@ -8,14 +8,24 @@ let redisClient;
 const connectRedis = async () => {
   // Skip Redis connection for development if Redis is not running
   try {
-    redisClient = redis.createClient({
-      url: `redis://${config.redis.host}:${config.redis.port}`,
+    const clientOptions = {
       password: config.redis.password || undefined,
       socket: {
         connectTimeout: config.redis.connectTimeout,
         reconnectStrategy: false
       }
-    });
+    };
+
+    // Sentinel discovery mode: connect via a list of sentinels that resolve
+    // the current primary. Falls back to a fixed host:port otherwise.
+    if (config.redis.sentinels.length > 0 && config.redis.sentinelMaster) {
+      clientOptions.sentinels = config.redis.sentinels;
+      clientOptions.name = config.redis.sentinelMaster;
+    } else {
+      clientOptions.url = `redis://${config.redis.host}:${config.redis.port}`;
+    }
+
+    redisClient = redis.createClient(clientOptions);
 
     redisClient.on('error', (err) => {
       logger.warn('Redis not available, continuing without Redis');
@@ -53,6 +63,22 @@ const connectRedis = async () => {
  * @returns {object|null} The Redis client or null if not connected
  */
 const getRedisClient = () => redisClient;
+
+/**
+ * Gracefully close the Redis connection and reset module state.
+ * Used by integration tests (afterAll) and graceful shutdown paths so the
+ * client socket never keeps the process (or Jest) alive.
+ */
+const disconnectRedis = async () => {
+  if (redisClient) {
+    try {
+      await redisClient.quit();
+    } catch (err) {
+      logger.warn('Error closing Redis connection:', err.message);
+    }
+    redisClient = null;
+  }
+};
 
 /**
  * Check if Redis is connected and available.
@@ -163,36 +189,52 @@ const isTokenBlacklisted = async (tokenId) => {
 };
 
 /**
- * Store a refresh token family for rotation tracking.
- * When a refresh token is used, the family ID links parent→child tokens.
- * If an old child is reused, the entire family is revoked.
- * 
- * @param {string} familyId - UUID identifying the token family
- * @param {string} currentTokenId - The currently valid token's JTI
- * @param {number} ttlSeconds - TTL matching refresh token expiry
+ * Refresh-token family store with graceful degradation.
+ *
+ * When Redis is unavailable the store falls back to an in-process map so that
+ * stolen-token replay detection keeps working (previously it silently turned
+ * off — a security regression on Redis blips). Revocation writes a REVOKED
+ * sentinel instead of deleting, so every token of the family (old and new)
+ * is rejected once the family has been revoked.
  */
+
+const FAMILY_REVOKED = 'REVOKED';
+const FAMILY_REVOKED_TTL_SECONDS = 24 * 60 * 60;
+const memoryFamilies = new Map(); // familyId -> { value, expiresAt }
+
 const setRefreshTokenFamily = async (familyId, currentTokenId, ttlSeconds = 2592000) => {
-  if (!isRedisAvailable()) return;
+  if (!isRedisAvailable()) {
+    memoryFamilies.set(familyId, {
+      value: currentTokenId,
+      expiresAt: Date.now() + ttlSeconds * 1000
+    });
+    return;
+  }
   await redisClient.setEx(`refresh_family:${familyId}`, ttlSeconds, currentTokenId);
 };
 
-/**
- * Get the currently valid token ID for a refresh token family.
- * @param {string} familyId 
- * @returns {string|null} The current valid JTI, or null
- */
 const getRefreshTokenFamily = async (familyId) => {
-  if (!isRedisAvailable()) return null;
+  if (!isRedisAvailable()) {
+    const entry = memoryFamilies.get(familyId);
+    if (!entry) return null;
+    if (Date.now() > entry.expiresAt) {
+      memoryFamilies.delete(familyId);
+      return null;
+    }
+    return entry.value;
+  }
   return await redisClient.get(`refresh_family:${familyId}`);
 };
 
-/**
- * Revoke an entire refresh token family (stolen token detection).
- * @param {string} familyId 
- */
 const revokeRefreshTokenFamily = async (familyId) => {
-  if (!isRedisAvailable()) return;
-  await redisClient.del(`refresh_family:${familyId}`);
+  if (!isRedisAvailable()) {
+    memoryFamilies.set(familyId, {
+      value: FAMILY_REVOKED,
+      expiresAt: Date.now() + FAMILY_REVOKED_TTL_SECONDS * 1000
+    });
+    return;
+  }
+  await redisClient.setEx(`refresh_family:${familyId}`, FAMILY_REVOKED_TTL_SECONDS, FAMILY_REVOKED);
 };
 
 // Usage tracking
@@ -247,6 +289,7 @@ module.exports = {
   getRedisClient,
   isRedisAvailable,
   connectRedis,
+  disconnectRedis,
   setSession,
   getSession,
   deleteSession,

@@ -14,8 +14,7 @@ import {
   ListItemText,
   ListItemIcon,
   Badge,
-  IconButton,
-  Tooltip
+  IconButton
 } from '@mui/material';
 import {
   Timeline,
@@ -40,7 +39,6 @@ import {
   Legend
 } from 'chart.js';
 import dayjs from 'dayjs';
-import api from '../../services/api';
 
 ChartJS.register(
   CategoryScale,
@@ -85,6 +83,7 @@ const RealTimeAnalytics = () => {
     }
 
     return () => stopRealTimeUpdates();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isLive]);
 
   const startRealTimeUpdates = () => {

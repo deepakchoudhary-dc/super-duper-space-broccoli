@@ -96,7 +96,7 @@ router.get('/', authenticateToken, async (req, res) => {
              COUNT(CASE WHEN ak.status = 'active' THEN 1 END) as active_keys
       FROM apis a
       LEFT JOIN api_keys ak ON a.id = ak.api_id
-      WHERE a.user_id = $1
+      WHERE (a.user_id = $1 OR a.org_id IN (SELECT org_id FROM organization_members WHERE user_id = $1))
     `;
     
     const queryParams = [userId];
@@ -120,7 +120,7 @@ router.get('/', authenticateToken, async (req, res) => {
     const result = await pool.query(query, queryParams);
 
     // Get total count for pagination
-    let countQuery = 'SELECT COUNT(*) FROM apis WHERE user_id = $1';
+    let countQuery = `SELECT COUNT(*) FROM apis WHERE (user_id = $1 OR org_id IN (SELECT org_id FROM organization_members WHERE user_id = $1))`;
     const countParams = [userId];
     let countParamCount = 1;
 
@@ -289,7 +289,13 @@ router.post('/', authenticateToken, createApiValidation, async (req, res) => {
       rate_limit,
       rateLimitWindow,
       rate_limit_window,
-      category
+      category,
+      orgId,
+      org_id,
+      transformConfig,
+      transform_config,
+      mtlsConfig,
+      mtls_config
     } = req.body;
 
     const actualBaseUrl = baseUrl || endpoint;
@@ -299,6 +305,37 @@ router.post('/', authenticateToken, createApiValidation, async (req, res) => {
     const actualRateLimit = rateLimit !== undefined ? parseInt(rateLimit) : (rate_limit !== undefined ? parseInt(rate_limit) : 1000);
     const actualRateLimitWindow = rateLimitWindow !== undefined ? parseInt(rateLimitWindow) : (rate_limit_window !== undefined ? parseInt(rate_limit_window) : 3600);
     const actualCategory = category || 'REST';
+
+    // Transformation + mTLS config validation (opt-in gateway policies)
+    const actualTransformConfig = transformConfig || transform_config || {};
+    const { validateTransformConfig } = require('../utils/transform');
+    const transformCheck = validateTransformConfig(actualTransformConfig);
+    if (!transformCheck.ok) {
+      return res.status(400).json({
+        success: false,
+        message: `Invalid transform config: ${transformCheck.errors.join('; ')}`
+      });
+    }
+    const actualMtlsConfig = mtlsConfig || mtls_config || null;
+    if (actualMtlsConfig && (!actualMtlsConfig.certPath || !actualMtlsConfig.keyPath)) {
+      return res.status(400).json({
+        success: false,
+        message: 'mTLS config requires certPath and keyPath'
+      });
+    }
+
+    // Organization attachment (multi-tenancy): creator must be a member
+    const actualOrgId = orgId || org_id || null;
+    if (actualOrgId) {
+      const { getOrgMembership } = require('../utils/orgs');
+      const membership = await getOrgMembership(actualOrgId, userId);
+      if (!membership) {
+        return res.status(403).json({
+          success: false,
+          message: 'You are not a member of that organization'
+        });
+      }
+    }
 
     // SECURITY: SSRF protection — validate the upstream base_url before storing.
     // Prevents registering internal/cloud-metadata targets that the gateway
@@ -338,9 +375,9 @@ router.post('/', authenticateToken, createApiValidation, async (req, res) => {
       INSERT INTO apis (
         user_id, name, description, base_url, version, 
         documentation_url, webhook_url, is_public, auth_required, 
-        rate_limit, rate_limit_window, category
+        rate_limit, rate_limit_window, category, org_id, transform_config, mtls_config
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
       RETURNING *
     `;
 
@@ -356,7 +393,10 @@ router.post('/', authenticateToken, createApiValidation, async (req, res) => {
       actualAuthRequired,
       actualRateLimit,
       actualRateLimitWindow,
-      actualCategory
+      actualCategory,
+      actualOrgId,
+      JSON.stringify(actualTransformConfig),
+      actualMtlsConfig ? JSON.stringify(actualMtlsConfig) : null
     ]);
 
     const api = apiResult.rows[0];
@@ -492,6 +532,30 @@ router.put('/:id', authenticateToken, checkResourceOwnership('api'), updateApiVa
     if (rlwVal !== undefined) cleanedFields.rate_limit_window = parseInt(rlwVal);
     
     if (updateFields.category !== undefined) cleanedFields.category = updateFields.category;
+
+    const newTransformConfig = updateFields.transformConfig || updateFields.transform_config;
+    if (newTransformConfig !== undefined) {
+      const { validateTransformConfig } = require('../utils/transform');
+      const transformCheck = validateTransformConfig(newTransformConfig);
+      if (!transformCheck.ok) {
+        return res.status(400).json({
+          success: false,
+          message: `Invalid transform config: ${transformCheck.errors.join('; ')}`
+        });
+      }
+      cleanedFields.transform_config = JSON.stringify(newTransformConfig);
+    }
+
+    const newMtlsConfig = updateFields.mtlsConfig || updateFields.mtls_config;
+    if (newMtlsConfig !== undefined) {
+      if (newMtlsConfig && (!newMtlsConfig.certPath || !newMtlsConfig.keyPath)) {
+        return res.status(400).json({
+          success: false,
+          message: 'mTLS config requires certPath and keyPath'
+        });
+      }
+      cleanedFields.mtls_config = newMtlsConfig ? JSON.stringify(newMtlsConfig) : null;
+    }
 
     const updateKeys = Object.keys(cleanedFields);
     if (updateKeys.length === 0) {
@@ -710,6 +774,68 @@ router.get('/:id/stats', authenticateToken, checkResourceOwnership('api'), async
       success: false,
       message: 'Failed to retrieve API statistics'
     });
+  }
+});
+
+// ============================================================================
+// UPDATE TRANSFORM CONFIG — per-API request/response transformation policy
+// ============================================================================
+
+/**
+ * @openapi
+ * /api/apis/{id}/transform:
+ *   patch:
+ *     summary: Set the per-API transformation policy (path rewrites, headers, CORS, gzip)
+ *     tags: [APIs]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               transformConfig:
+ *                 type: object
+ *                 description: See server/utils/transform.js for the full shape
+ *     responses:
+ *       200:
+ *         description: Transform policy updated
+ *       400:
+ *         description: Invalid transform config
+ */
+router.patch('/:id/transform', authenticateToken, checkResourceOwnership('api'), async (req, res) => {
+  try {
+    const apiId = req.params.id;
+    const { transformConfig } = req.body;
+    if (transformConfig === undefined || transformConfig === null) {
+      return res.status(400).json({ success: false, message: 'transformConfig is required' });
+    }
+
+    const { validateTransformConfig } = require('../utils/transform');
+    const transformCheck = validateTransformConfig(transformConfig);
+    if (!transformCheck.ok) {
+      return res.status(400).json({
+        success: false,
+        message: `Invalid transform config: ${transformCheck.errors.join('; ')}`
+      });
+    }
+
+    const result = await pool.query(
+      `UPDATE apis SET transform_config = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 RETURNING id, transform_config`,
+      [JSON.stringify(transformConfig), apiId]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'API not found' });
+    }
+
+    await logAuditEvent(req.user.id, 'API_TRANSFORM_UPDATED', apiId, { transformConfig }, req);
+
+    res.json({ success: true, message: 'Transform policy updated', data: { transformConfig: result.rows[0].transform_config } });
+  } catch (error) {
+    logger.error('Update transform config error:', error);
+    res.status(500).json({ success: false, message: 'Failed to update transform config' });
   }
 });
 

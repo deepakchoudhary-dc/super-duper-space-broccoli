@@ -17,14 +17,8 @@ import {
   Tab,
   Tabs,
   Alert,
-  Tooltip,
   Menu,
   MenuItem,
-  Dialog,
-  DialogTitle,
-  DialogContent,
-  DialogActions,
-  TextField,
   Switch,
   FormControlLabel
 } from '@mui/material';
@@ -42,10 +36,7 @@ import {
   CheckCircle,
   Error,
   Warning,
-  Key,
-  Analytics,
-  PlayArrow,
-  Pause
+  Key
 } from '@mui/icons-material';
 import { useParams, useNavigate } from 'react-router-dom';
 import { toast } from 'react-toastify';
@@ -61,7 +52,6 @@ const APIDetails = () => {
   const [tabValue, setTabValue] = useState(0);
   const [anchorEl, setAnchorEl] = useState(null);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
-  const [settingsDialogOpen, setSettingsDialogOpen] = useState(false);
   const [apiKeys, setApiKeys] = useState([]);
   const [analytics, setAnalytics] = useState({});
 
@@ -71,6 +61,7 @@ const APIDetails = () => {
       fetchAPIKeys();
       fetchAnalytics();
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
 
   const fetchAPIDetails = async () => {
@@ -462,7 +453,7 @@ const APIDetails = () => {
           <Edit sx={{ mr: 1 }} fontSize="small" />
           Edit API
         </MenuItem>
-        <MenuItem onClick={() => setSettingsDialogOpen(true)}>
+        <MenuItem onClick={handleMenuClose}>
           <Settings sx={{ mr: 1 }} fontSize="small" />
           Settings
         </MenuItem>

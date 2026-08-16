@@ -15,7 +15,6 @@ import {
   Chip,
   IconButton,
   Divider,
-  Alert,
   Card,
   CardContent,
   List,
@@ -28,9 +27,7 @@ import {
   ArrowBack,
   Save,
   Add,
-  Delete,
   Security,
-  Speed,
   Visibility,
   Api,
   Help
@@ -67,6 +64,7 @@ const EditAPI = () => {
     if (id) {
       fetchAPIDetails();
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
 
   const fetchAPIDetails = async () => {

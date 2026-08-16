@@ -111,7 +111,7 @@ const createTables = async () => {
 
     `CREATE TABLE IF NOT EXISTS audit_logs (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+      user_id UUID REFERENCES users(id) ON DELETE SET NULL,
       action VARCHAR(100) NOT NULL,
       resource_type VARCHAR(50) NOT NULL,
       resource_id UUID,
@@ -119,6 +119,24 @@ const createTables = async () => {
       ip_address INET,
       user_agent TEXT,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`,
+
+    `CREATE TABLE IF NOT EXISTS organizations (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      name VARCHAR(255) NOT NULL,
+      owner_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(name)
+    )`,
+
+    `CREATE TABLE IF NOT EXISTS organization_members (
+      org_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      role VARCHAR(20) NOT NULL DEFAULT 'member',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (org_id, user_id),
+      CHECK (role IN ('owner', 'admin', 'member'))
     )`,
 
     `CREATE TABLE IF NOT EXISTS password_reset_tokens (
@@ -147,6 +165,10 @@ const createTables = async () => {
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS failed_login_attempts INTEGER DEFAULT 0`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until TIMESTAMP`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMP`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN DEFAULT FALSE`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS oauth_provider VARCHAR(50)`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS oauth_subject VARCHAR(255)`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS oauth_email_verified BOOLEAN DEFAULT FALSE`,
     // apis — older databases lack columns the current code expects
     `ALTER TABLE apis ADD COLUMN IF NOT EXISTS version VARCHAR(50) DEFAULT '1.0.0'`,
     `ALTER TABLE apis ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'active'`,
@@ -157,6 +179,9 @@ const createTables = async () => {
     `ALTER TABLE apis ADD COLUMN IF NOT EXISTS rate_limit INTEGER DEFAULT 1000`,
     `ALTER TABLE apis ADD COLUMN IF NOT EXISTS rate_limit_window INTEGER DEFAULT 3600`,
     `ALTER TABLE apis ADD COLUMN IF NOT EXISTS category VARCHAR(50) DEFAULT 'REST'`,
+    `ALTER TABLE apis ADD COLUMN IF NOT EXISTS org_id UUID REFERENCES organizations(id) ON DELETE SET NULL`,
+    `ALTER TABLE apis ADD COLUMN IF NOT EXISTS transform_config JSONB DEFAULT '{}'`,
+    `ALTER TABLE apis ADD COLUMN IF NOT EXISTS mtls_config JSONB DEFAULT '{}'`,
     `ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS key_hash VARCHAR(255)`,
     `ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS key_prefix VARCHAR(20)`,
     `ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS burst_limit INTEGER DEFAULT 0`,
@@ -174,6 +199,11 @@ const createTables = async () => {
     `CREATE INDEX IF NOT EXISTS idx_api_usage_logs_created_at ON api_usage_logs(created_at)`,
     `CREATE INDEX IF NOT EXISTS idx_audit_logs_user_id ON audit_logs(user_id)`,
     `CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at)`,
+    `CREATE INDEX IF NOT EXISTS idx_audit_logs_action ON audit_logs(action)`,
+    `CREATE INDEX IF NOT EXISTS idx_apis_org_id ON apis(org_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_api_keys_expires_at ON api_keys(expires_at)`,
+    `CREATE INDEX IF NOT EXISTS idx_org_members_user ON organization_members(user_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_org_members_role ON organization_members(role)`,
 
     // 4. Trigger function
     `CREATE OR REPLACE FUNCTION update_updated_at_column()
@@ -195,7 +225,27 @@ const createTables = async () => {
 
     `DROP TRIGGER IF EXISTS update_api_keys_updated_at ON api_keys`,
     `CREATE TRIGGER update_api_keys_updated_at BEFORE UPDATE ON api_keys
-        FOR EACH ROW EXECUTE FUNCTION update_updated_at_column()`
+        FOR EACH ROW EXECUTE FUNCTION update_updated_at_column()`,
+
+    `DROP TRIGGER IF EXISTS update_organizations_updated_at ON organizations`,
+    `CREATE TRIGGER update_organizations_updated_at BEFORE UPDATE ON organizations
+        FOR EACH ROW EXECUTE FUNCTION update_updated_at_column()`,
+
+    // 6. Audit log immutability — append-only by construction (DB-enforced)
+    `CREATE OR REPLACE FUNCTION prevent_audit_mutation()
+    RETURNS TRIGGER AS $$
+    BEGIN
+        RAISE EXCEPTION 'audit_logs are append-only; updates and deletes are forbidden';
+    END;
+    $$ language 'plpgsql'`,
+
+    `DROP TRIGGER IF EXISTS audit_logs_no_update ON audit_logs`,
+    `CREATE TRIGGER audit_logs_no_update BEFORE UPDATE ON audit_logs
+        FOR EACH ROW EXECUTE FUNCTION prevent_audit_mutation()`,
+
+    `DROP TRIGGER IF EXISTS audit_logs_no_delete ON audit_logs`,
+    `CREATE TRIGGER audit_logs_no_delete BEFORE DELETE ON audit_logs
+        FOR EACH ROW EXECUTE FUNCTION prevent_audit_mutation()`
   ];
 
   for (const sql of schemaStatements) {

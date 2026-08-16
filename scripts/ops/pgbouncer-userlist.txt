@@ -1,0 +1,14 @@
+# PgBouncer userlist — one line per database user.
+#
+# WARNING: This file contains scram-sha-256 hashes, NOT plaintext passwords.
+# Generate a hash for your real DB password with:
+#
+#   printf 'postgres' | docker run -i --rm edoburu/pgbouncer \
+#     psql -h localhost -U postgres -c "SELECT concat('\"', usename, '\" \"', passwd, '\"') FROM pg_shadow WHERE usename = current_user;"
+#
+# (or use `SCRAM-SHA-256$<iterations>:<salt>$<storedkey>:<serverkey>` from
+#  pg_authid — the format PgBouncer accepts is the full `SCRAM-SHA-256$...`
+#  string from pg_shadow.passwd).
+#
+# Example (replace the hash with your own):
+"postgres" "SCRAM-SHA-256$4096:REPLACE_WITH_SALT$REPLACE_WITH_STORED_KEY:REPLACE_WITH_SERVER_KEY"

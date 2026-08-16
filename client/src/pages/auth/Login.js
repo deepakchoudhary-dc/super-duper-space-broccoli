@@ -1,7 +1,5 @@
 import React, { useState } from 'react';
 import {
-  Container,
-  Paper,
   TextField,
   Button,
   Typography,
@@ -19,7 +17,8 @@ import {
   Email,
   Lock,
   Google,
-  GitHub
+  GitHub,
+  Security
 } from '@mui/icons-material';
 import { Link as RouterLink, useNavigate } from 'react-router-dom';
 import { useAuth } from '../../contexts/AuthContext';
@@ -89,8 +88,8 @@ const Login = () => {
   return (
     <Box sx={{ width: '100%', display: 'flex', flexDirection: 'column' }}>
           <Box sx={{ textAlign: 'center', mb: 3 }}>
-            <Typography variant="h3" sx={{ mb: 1, fontWeight: 'bold' }}>
-              🛡️
+            <Typography variant="h3" sx={{ mb: 1, fontWeight: 'bold', color: 'primary.main' }}>
+              <Security sx={{ fontSize: '3rem' }} />
             </Typography>
             <Typography variant="h4" component="h1" gutterBottom>
               Welcome Back
@@ -212,6 +211,10 @@ const Login = () => {
                     variant="outlined"
                     startIcon={<Google />}
                     sx={{ py: 1 }}
+                    onClick={() => {
+                      const base = process.env.REACT_APP_API_URL || 'http://localhost:5000';
+                      window.location.href = `${base}/api/auth/oidc/authorize`;
+                    }}
                   >
                     Google
                   </Button>
@@ -220,6 +223,10 @@ const Login = () => {
                     variant="outlined"
                     startIcon={<GitHub />}
                     sx={{ py: 1 }}
+                    onClick={() => {
+                      const base = process.env.REACT_APP_API_URL || 'http://localhost:5000';
+                      window.location.href = `${base}/api/auth/oidc/authorize`;
+                    }}
                   >
                     GitHub
                   </Button>

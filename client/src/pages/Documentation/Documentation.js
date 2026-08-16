@@ -14,10 +14,6 @@ import {
   ListItemIcon,
   Chip,
   Button,
-  Divider,
-  Accordion,
-  AccordionSummary,
-  AccordionDetails,
   Alert,
   IconButton,
   Tooltip
@@ -28,7 +24,6 @@ import {
   Api as ApiIcon,
   Code as CodeIcon,
   Launch as LaunchIcon,
-  ExpandMore as ExpandMoreIcon,
   BookmarkBorder as BookmarkIcon,
   Share as ShareIcon,
   Download as DownloadIcon

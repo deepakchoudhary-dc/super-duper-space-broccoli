@@ -1,0 +1,22 @@
+{
+  "name": "@api-guardian/cli",
+  "version": "1.0.0",
+  "description": "Command-line interface for the API Guardian gateway — manage APIs, keys, orgs and the audit trail from your terminal.",
+  "main": "bin/guardian.js",
+  "bin": {
+    "guardian": "bin/guardian.js"
+  },
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "api-gateway",
+    "api-guardian",
+    "cli",
+    "devops"
+  ],
+  "license": "MIT"
+}

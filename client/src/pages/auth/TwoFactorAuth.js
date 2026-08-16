@@ -1,7 +1,5 @@
 import React, { useState, useEffect } from 'react';
 import {
-  Container,
-  Paper,
   TextField,
   Button,
   Typography,
@@ -65,7 +63,7 @@ const TwoFactorAuth = () => {
     setError('');
 
     try {
-      const response = await api.post('/api/auth/verify-2fa', {
+      await api.post('/api/auth/verify-2fa', {
         email: credentials.email,
         password: credentials.password,
         twoFactorCode: code

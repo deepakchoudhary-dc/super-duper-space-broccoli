@@ -4,8 +4,6 @@ import {
   Typography,
   Paper,
   Grid,
-  Card,
-  CardContent,
   FormControl,
   InputLabel,
   Select,
@@ -30,16 +28,12 @@ import {
   Refresh,
   Download,
   TrendingUp,
-  TrendingDown,
   Api as ApiIcon,
   Speed,
-  CheckCircle,
-  Error,
-  Warning,
-  Timeline
+  CheckCircle
 } from '@mui/icons-material';
 import { useParams, useNavigate } from 'react-router-dom';
-import { Line, Bar, Doughnut } from 'react-chartjs-2';
+import { Line, Doughnut } from 'react-chartjs-2';
 import {
   Chart as ChartJS,
   CategoryScale,
@@ -84,6 +78,7 @@ const APIAnalytics = () => {
       fetchAPIDetails();
       fetchAnalytics();
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id, timeRange]);
 
   const fetchAPIDetails = async () => {
@@ -101,7 +96,7 @@ const APIAnalytics = () => {
   const fetchAnalytics = async () => {
     try {
       setLoading(true);
-      const response = await apiService.get(`/apis/${id}/analytics?timeRange=${timeRange}`);
+      await apiService.get(`/apis/${id}/analytics?timeRange=${timeRange}`);
       
       // Mock analytics data
       const mockAnalytics = {

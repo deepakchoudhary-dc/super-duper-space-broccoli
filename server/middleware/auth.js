@@ -4,6 +4,7 @@ const { getCachedApiKey, cacheApiKey, isTokenBlacklisted } = require('../config/
 const { hashApiKey, isValidKeyFormat, extractKeyPrefix, verifyApiKey } = require('../utils/crypto');
 const config = require('../config/env');
 const logger = require('../utils/logger');
+const { recordEvent } = require('../utils/tracing');
 
 // ============================================================================
 // JWT SECRET RESOLUTION
@@ -69,7 +70,7 @@ const authenticateToken = async (req, res, next) => {
     }
 
     // Get user from database
-    const userQuery = 'SELECT id, email, first_name, last_name, two_fa_enabled FROM users WHERE id = $1';
+    const userQuery = 'SELECT id, email, first_name, last_name, two_fa_enabled, is_admin FROM users WHERE id = $1';
     const userResult = await pool.query(userQuery, [decoded.id]);
     
     if (userResult.rows.length === 0) {
@@ -118,7 +119,7 @@ const authenticateToken = async (req, res, next) => {
  * - Extracts prefix for indexed DB lookup (narrowing search)
  * - Hashes the incoming key with SHA-256 and compares against stored hash
  * - Uses constant-time comparison to prevent timing attacks
- * - Caches hash→keyData in Redis (never caches raw keys)
+ * - Caches hash to keyData in Redis (never caches raw keys)
  */
 const authenticateApiKey = async (req, res, next) => {
   try {
@@ -152,7 +153,8 @@ const authenticateApiKey = async (req, res, next) => {
     if (!keyData) {
       // Query by hash — the key_hash column now stores SHA-256 hashes
       const keyQuery = `
-        SELECT ak.*, a.name as api_name, a.base_url, a.status as api_status, u.id as user_id
+        SELECT ak.*, a.name as api_name, a.base_url, a.status as api_status, u.id as user_id,
+               a.transform_config, a.mtls_config
         FROM api_keys ak
         JOIN apis a ON ak.api_id = a.id
         JOIN users u ON ak.user_id = u.id
@@ -295,6 +297,12 @@ const rateLimitMiddleware = async (req, res, next) => {
 
     if (!rateResult.allowed) {
       incrementRateLimitExceeded(apiKey.id, rateResult.tier);
+      recordEvent('rate_limit.exceeded', {
+        key_id: apiKey.id,
+        tier: rateResult.tier,
+        current: rateResult.current,
+        limit: rateResult.limit || limit
+      });
       logger.logSecurityEvent('RATE_LIMIT_EXCEEDED', {
         keyId: apiKey.id,
         keyName: apiKey.name,
@@ -303,6 +311,22 @@ const rateLimitMiddleware = async (req, res, next) => {
         current: rateResult.current,
         limit: rateResult.limit || limit,
         ip: req.ip
+      });
+
+      // Immutable audit trail
+      require('../utils/audit').audit({
+        userId: apiKey.user_id,
+        action: 'SECURITY_RATE_LIMIT_EXCEEDED',
+        resourceType: 'api_key',
+        resourceId: apiKey.id,
+        details: {
+          keyName: apiKey.name,
+          apiId: apiKey.api_id,
+          tier: rateResult.tier,
+          current: rateResult.current,
+          limit: rateResult.limit || limit
+        },
+        req
       });
 
       // Alert the key owner (email, cooldown-throttled)
@@ -351,10 +375,23 @@ const checkResourceOwnership = (resourceType) => {
       let query;
       switch (resourceType) {
         case 'api':
-          query = 'SELECT user_id FROM apis WHERE id = $1';
+          // Ownership OR organization membership grants access
+          query = `
+            SELECT a.user_id,
+                   EXISTS(SELECT 1 FROM organization_members om
+                          WHERE om.org_id = a.org_id AND om.user_id = $2) AS is_org_member
+            FROM apis a WHERE a.id = $1
+          `;
           break;
         case 'api_key':
-          query = 'SELECT user_id FROM api_keys WHERE id = $1';
+          query = `
+            SELECT ak.user_id,
+                   EXISTS(SELECT 1 FROM organization_members om
+                          WHERE om.org_id = a.org_id AND om.user_id = $2) AS is_org_member
+            FROM api_keys ak
+            JOIN apis a ON a.id = ak.api_id
+            WHERE ak.id = $1
+          `;
           break;
         default:
           return res.status(400).json({
@@ -363,7 +400,7 @@ const checkResourceOwnership = (resourceType) => {
           });
       }
 
-      const result = await pool.query(query, [resourceId]);
+      const result = await pool.query(query, [resourceId, userId]);
       
       if (result.rows.length === 0) {
         return res.status(404).json({
@@ -372,7 +409,7 @@ const checkResourceOwnership = (resourceType) => {
         });
       }
 
-      if (result.rows[0].user_id !== userId) {
+      if (result.rows[0].user_id !== userId && result.rows[0].is_org_member !== true) {
         return res.status(403).json({
           success: false,
           message: 'Access denied'

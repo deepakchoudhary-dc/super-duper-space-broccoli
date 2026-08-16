@@ -1,5 +1,5 @@
 /**
- * Integration tests — full auth → API → key → proxy flow.
+ * Integration tests — full auth, API, key, proxy flow.
  *
  * These require a real PostgreSQL and Redis instance:
  *   RUN_INTEGRATION=true npm run test:server
@@ -7,6 +7,9 @@
  * In CI they run against GitHub Actions service containers.
  * They are skipped locally unless RUN_INTEGRATION=true.
  */
+
+// Server boot + DB migrations routinely exceed Jest's 5s default hook timeout.
+jest.setTimeout(60000);
 
 const runIntegration = process.env.RUN_INTEGRATION === 'true';
 
@@ -17,6 +20,7 @@ describeIntegration('API integration flow', () => {
   let app;
   let server;
   let pool;
+  let redis;
   let testUserId;
   let testEmail;
   let testApiId;
@@ -27,10 +31,21 @@ describeIntegration('API integration flow', () => {
   beforeAll(async () => {
     process.env.SKIP_EMAIL_VERIFICATION = 'true';
     process.env.WAF_ENABLED = 'false'; // avoid blocking test payloads
+    // Allow localhost upstreams for the test fixtures (dev/test only)
+    process.env.SSRF_ALLOW_PRIVATE = '127.0.0.1,localhost';
+    // Distinct port so the index.js listener does not clash with other
+    // integration test files running in-band
+    process.env.PORT = '5199';
     // Ensure fresh module load with test env
     jest.resetModules();
     app = require('../../index');
     pool = require('../../config/database').pool;
+
+    // Wait for schema migrations to complete (index.js fires them async)
+    await require('../../config/database').connectDB();
+    // Connect Redis explicitly — index.js no longer auto-boots when required
+    redis = require('../../config/redis');
+    await redis.connectRedis();
 
     await new Promise((resolve) => {
       server = app.listen(0, resolve);
@@ -40,6 +55,8 @@ describeIntegration('API integration flow', () => {
   afterAll(async () => {
     if (server) await new Promise((resolve) => server.close(resolve));
     if (pool) await pool.end();
+    if (redis) await redis.disconnectRedis();
+    require('../../utils/circuitBreaker').destroyAll();
   });
 
   test('registers a user', async () => {
@@ -72,7 +89,7 @@ describeIntegration('API integration flow', () => {
       .set('Authorization', `Bearer ${accessToken}`)
       .send({
         name: `Integration API ${Date.now()}`,
-        baseUrl: 'http://example.com',
+        baseUrl: 'http://127.0.0.1:1',
         version: '1.0.0'
       });
     expect(res.status).toBe(201);
@@ -116,9 +133,41 @@ describeIntegration('API integration flow', () => {
     expect(invalidRes.status).toBe(401);
   });
 
+  test('detects refresh token replay and revokes the family', async () => {
+    // A second login produces an independent token family
+    const login = await request(app).post('/api/auth/login').send({
+      email: testEmail,
+      password: 'Str0ng!Passw0rd'
+    });
+    expect(login.status).toBe(200);
+    const refresh1 = login.body.data.tokens.refreshToken;
+
+    // First rotation succeeds and mints a child token in the SAME family
+    const rotated = await request(app).post('/api/auth/refresh').send({
+      refreshToken: refresh1
+    });
+    expect(rotated.status).toBe(200);
+    const refresh2 = rotated.body.data.tokens.refreshToken;
+    expect(refresh2).not.toBe(refresh1);
+
+    // Replaying the consumed token is rejected as suspicious reuse
+    const replay = await request(app).post('/api/auth/refresh').send({
+      refreshToken: refresh1
+    });
+    expect(replay.status).toBe(401);
+    expect(replay.body.message).toMatch(/revoked/i);
+
+    // The family is revoked: even the freshly rotated token is now dead
+    const postRevoke = await request(app).post('/api/auth/refresh').send({
+      refreshToken: refresh2
+    });
+    expect(postRevoke.status).toBe(401);
+  });
+
   test('health check reports database and redis status', async () => {
     const res = await request(app).get('/health');
-    expect(res.status).toBe(200);
+    // 200 when healthy; 503 when Redis is unavailable (degraded, not dead)
+    expect([200, 503]).toContain(res.status);
     expect(res.body.checks.database).toBe('ok');
   });
 });

@@ -85,10 +85,9 @@ const loginValidation = [
  * - Each refresh token belongs to a "family" for rotation detection
  * - JTI (JWT ID) enables individual token blacklisting
  */
-const generateTokens = (userId) => {
+const generateTokens = (userId, familyId = uuidv4()) => {
   const accessJti = uuidv4();
   const refreshJti = uuidv4();
-  const familyId = uuidv4();
 
   const accessToken = jwt.sign(
     { id: userId, type: 'access', jti: accessJti },
@@ -1103,13 +1102,28 @@ router.post('/refresh', refreshLimiter, [
     }
 
     // Check if this specific token is blacklisted
-    const { isTokenBlacklisted } = require('../config/redis');
+    const { isTokenBlacklisted, revokeRefreshTokenFamily } = require('../config/redis');
     if (decoded.jti && await isTokenBlacklisted(decoded.jti)) {
       logger.logSecurityEvent('BLACKLISTED_TOKEN_REUSE', {
         userId: decoded.id,
         jti: decoded.jti,
         ip: req.ip
       });
+
+      // Reuse of a consumed token is a replay signal — revoke the whole family
+      // so the freshly rotated token dies too (consistent with the family check).
+      if (decoded.family) {
+        await revokeRefreshTokenFamily(decoded.family);
+      }
+
+      require('../utils/audit').audit({
+        userId: decoded.id,
+        action: 'SECURITY_BLACKLISTED_TOKEN_REUSE',
+        resourceType: 'auth',
+        details: { jti: decoded.jti, ip: req.ip },
+        req
+      });
+
       return res.status(401).json({
         success: false,
         message: 'Token has been revoked'
@@ -1133,6 +1147,14 @@ router.post('/refresh', refreshLimiter, [
         });
 
         await revokeRefreshTokenFamily(decoded.family);
+
+        require('../utils/audit').audit({
+          userId: decoded.id,
+          action: 'SECURITY_REFRESH_TOKEN_REPLAY',
+          resourceType: 'auth',
+          details: { familyId: decoded.family, replayedJti: decoded.jti, ip: req.ip },
+          req
+        });
 
         return res.status(401).json({
           success: false,
@@ -1160,8 +1182,10 @@ router.post('/refresh', refreshLimiter, [
       await blacklistToken(decoded.jti, ttl);
     }
 
-    // Generate new token pair (with new family continuation)
-    const tokens = generateTokens(user.id);
+    // Rotate WITHIN the same family: the new refresh token carries the old
+    // family ID with a fresh JTI, so replaying the consumed token is detected
+    // (getRefreshTokenFamily returns the new JTI != replayed JTI).
+    const tokens = generateTokens(user.id, decoded.family);
 
     res.json({
       success: true,
@@ -1184,3 +1208,4 @@ router.post('/refresh', refreshLimiter, [
 });
 
 module.exports = router;
+module.exports.generateTokens = generateTokens;

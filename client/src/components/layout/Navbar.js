@@ -21,7 +21,8 @@ import {
   VpnKey,
   Api,
   Analytics,
-  Description
+  Description,
+  Security
 } from '@mui/icons-material';
 import { useAuth } from '../../contexts/AuthContext';
 import { useNavigate } from 'react-router-dom';
@@ -93,7 +94,8 @@ const Navbar = ({ onDrawerToggle }) => {
             gap: 1
           }}
         >
-          🛡️ API Guardian
+          <Security sx={{ fontSize: 22 }} />
+          API Guardian
         </Typography>
 
         {user && (

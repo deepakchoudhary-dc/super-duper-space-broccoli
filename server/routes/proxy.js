@@ -1,6 +1,8 @@
 const express = require('express');
 const http = require('http');
 const https = require('https');
+const zlib = require('zlib');
+const fs = require('fs');
 const { URL } = require('url');
 const { v4: uuidv4 } = require('uuid');
 
@@ -15,8 +17,28 @@ const { wafMiddleware } = require('../utils/waf');
 const { validateUrl, isObviousInternal } = require('../utils/ssrf');
 const { getCircuitBreaker, getBreakerState } = require('../utils/circuitBreaker');
 const metrics = require('../utils/metrics');
+const { audit } = require('../utils/audit');
+const {
+  getResponseCache,
+  setResponseCache
+} = require('../utils/cache');
+const {
+  applyRequestHeaderRules,
+  applyResponseHeaderRules,
+  corsAllowOrigins,
+  shouldGzip,
+  rewriteTargetPath,
+  stripQueryParams
+} = require('../utils/transform');
 const config = require('../config/env');
 const logger = require('../utils/logger');
+const {
+  withSpan,
+  recordEvent,
+  injectTraceHeaders,
+  extractContextFromHeaders,
+  withContext
+} = require('../utils/tracing');
 
 const router = express.Router();
 
@@ -26,22 +48,56 @@ const router = express.Router();
 
 const agentPool = new Map();
 
-const getAgent = (baseUrl) => {
+// Cache of loaded mTLS client certificate material: baseUrl -> { cert, key, ca }
+const mtlsMaterialCache = new Map();
+
+const loadMtlsMaterial = (mtlsConfig) => {
+  if (!mtlsConfig || !mtlsConfig.certPath || !mtlsConfig.keyPath) return null;
+  const cacheKey = `${mtlsConfig.certPath}:${mtlsConfig.keyPath}:${mtlsConfig.caPath || ''}`;
+  if (mtlsMaterialCache.has(cacheKey)) return mtlsMaterialCache.get(cacheKey);
+
+  try {
+    const material = {
+      cert: fs.readFileSync(mtlsConfig.certPath),
+      key: fs.readFileSync(mtlsConfig.keyPath),
+      ca: mtlsConfig.caPath ? fs.readFileSync(mtlsConfig.caPath) : undefined
+    };
+    mtlsMaterialCache.set(cacheKey, material);
+    return material;
+  } catch (err) {
+    logger.error('Failed to load mTLS client certificate material:', err.message);
+    return null;
+  }
+};
+
+const getAgent = (baseUrl, mtlsConfig) => {
   if (agentPool.has(baseUrl)) {
     return agentPool.get(baseUrl);
   }
 
   const url = new URL(baseUrl);
   const AgentClass = url.protocol === 'https:' ? https.Agent : http.Agent;
-
-  const agent = new AgentClass({
+  const agentOptions = {
     keepAlive: true,
     keepAliveMsecs: 30000,
     maxSockets: config.proxy.maxSockets,
     maxFreeSockets: 10,
     timeout: config.proxy.connectTimeoutMs
-  });
+  };
 
+  // mTLS: present a client certificate to the upstream when configured
+  if (url.protocol === 'https:' && mtlsConfig) {
+    const material = loadMtlsMaterial(mtlsConfig);
+    if (material) {
+      agentOptions.cert = material.cert;
+      agentOptions.key = material.key;
+      agentOptions.ca = material.ca;
+      agentOptions.rejectUnauthorized = true;
+      logger.info('mTLS client certificate configured for upstream', { baseUrl });
+    }
+  }
+
+  const agent = new AgentClass(agentOptions);
   agentPool.set(baseUrl, agent);
   return agent;
 };
@@ -123,7 +179,7 @@ const FORWARDED_HEADERS = new Set([
 /**
  * Build a sanitized header set to forward upstream.
  */
-const buildForwardHeaders = (req, keyData) => {
+const buildForwardHeaders = (req, keyData, transformCfg) => {
   const headers = {};
 
   for (const [name, value] of Object.entries(req.headers)) {
@@ -142,6 +198,9 @@ const buildForwardHeaders = (req, keyData) => {
   headers['x-forwarded-for'] = req.ip;
   headers['x-real-ip'] = req.ip;
   headers['x-request-id'] = req.requestId || uuidv4();
+
+  // Apply per-API request header transformation rules
+  applyRequestHeaderRules(headers, transformCfg);
 
   return headers;
 };
@@ -293,7 +352,31 @@ const validateEndpointPermissions = (req, res, next) => {
 // STREAMING REVERSE PROXY (zero-copy, persistent connections, circuit-aware)
 // ============================================================================
 
-const proxyRequest = async (req, res, targetUrl, baseUrl) => {
+const proxyRequest = async (req, res, targetUrl, baseUrl, targetPath, query, transformCfg) => {
+  const keyId = req.apiKey.id;
+  const method = req.method;
+  const cacheableMethod = method === 'GET' || method === 'HEAD';
+
+  // --- Response cache: serve cached GET/HEAD without touching the upstream ---
+  if (cacheableMethod) {
+    const cached = await getResponseCache(keyId, method, targetPath, query);
+    if (cached) {
+      recordEvent('cache.hit', { method, key_id: keyId });
+      const responseHeaders = { ...cached.headers };
+      delete responseHeaders['content-length'];
+      applyResponseHeaderRules(responseHeaders, transformCfg);
+      responseHeaders['access-control-allow-origin'] = '*'; // re-applied below when CORS configured
+      responseHeaders['x-api-guardian-key-id'] = keyId;
+      responseHeaders['x-api-guardian-rate-limit'] = String(req.apiKey.rate_limit);
+      responseHeaders['x-api-guardian-rate-window'] = String(req.apiKey.rate_limit_window);
+      responseHeaders['x-request-id'] = req.requestId;
+      responseHeaders['x-cache'] = 'HIT';
+      res.writeHead(cached.statusCode, responseHeaders);
+      res.end(method === 'HEAD' ? undefined : cached.body);
+      return;
+    }
+  }    recordEvent('cache.miss', { method, key_id: keyId });
+
   // --- Circuit breaker: fail fast if the upstream is unhealthy ---
   const breaker = getCircuitBreaker({
     baseUrl,
@@ -304,6 +387,34 @@ const proxyRequest = async (req, res, targetUrl, baseUrl) => {
 
   if (!breaker.allowRequest()) {
     metrics.incrementCounter('gateway_upstream_failures_total', { api_id: req.apiKey.api_id });
+
+    // Immutable audit trail + cooldown-throttled owner alert (never breaks the 503)
+    audit({
+      userId: req.user?.id || null,
+      action: 'SECURITY_CIRCUIT_OPEN',
+      resourceType: 'api',
+      resourceId: req.apiKey.api_id,
+      details: { baseUrl, state: breaker.getState(), keyId },
+      req
+    });
+
+    try {
+      require('../utils/alerts').notifySecurityAlert(
+        req.user?.id,
+        'Upstream circuit opened',
+        {
+          apiId: req.apiKey.api_id,
+          apiName: req.apiKey.api_name,
+          baseUrl,
+          state: breaker.getState(),
+          keyId,
+          timestamp: new Date().toISOString()
+        }
+      ).catch(() => {});
+    } catch (alertErr) {
+      logger.error('Circuit-open alert failed:', alertErr.message);
+    }
+
     return res.status(503).json({
       success: false,
       message: 'Service temporarily unavailable (upstream circuit open)'
@@ -319,6 +430,14 @@ const proxyRequest = async (req, res, targetUrl, baseUrl) => {
       ip: req.ip,
       requestId: req.requestId
     });
+    audit({
+      userId: req.user?.id || null,
+      action: 'SECURITY_SSRF_BLOCKED',
+      resourceType: 'api',
+      resourceId: req.apiKey.api_id,
+      details: { targetUrl, reason: validation.reason, keyId },
+      req
+    });
     return res.status(400).json({
       success: false,
       message: 'Invalid upstream target'
@@ -326,16 +445,20 @@ const proxyRequest = async (req, res, targetUrl, baseUrl) => {
   }
 
   const url = new URL(targetUrl);
-  const agent = getAgent(baseUrl);
+  const agent = getAgent(baseUrl, req.apiKey.mtls_config);
   const httpModule = url.protocol === 'https:' ? https : http;
 
   const options = {
     hostname: url.hostname,
     port: url.port || (url.protocol === 'https:' ? 443 : 80),
     path: url.pathname + url.search,
-    method: req.method,
+    method,
     agent,
-    headers: buildForwardHeaders(req, req.apiKey),
+    headers: {
+      ...buildForwardHeaders(req, req.apiKey, transformCfg),
+      // Continue the W3C trace into the upstream request
+      ...injectTraceHeaders()
+    },
     timeout: config.proxy.connectTimeoutMs
   };
 
@@ -343,7 +466,7 @@ const proxyRequest = async (req, res, targetUrl, baseUrl) => {
     requestId: req.requestId,
     originalUrl: req.originalUrl,
     targetUrl,
-    method: req.method
+    method
   });
 
   let succeeded = false;
@@ -359,18 +482,57 @@ const proxyRequest = async (req, res, targetUrl, baseUrl) => {
     delete responseHeaders['keep-alive'];
     delete responseHeaders['transfer-encoding'];
 
-    responseHeaders['access-control-allow-origin'] = '*';
+    // Per-API response header rules + CORS policy (falls back to '*')
+    applyResponseHeaderRules(responseHeaders, transformCfg);
+    const origins = corsAllowOrigins(transformCfg);
+    if (origins) {
+      responseHeaders['access-control-allow-origin'] = origins.includes(String(req.headers.origin))
+        ? req.headers.origin
+        : origins[0];
+    } else {
+      responseHeaders['access-control-allow-origin'] = '*';
+    }
     responseHeaders['access-control-allow-methods'] = 'GET, POST, PUT, DELETE, PATCH, OPTIONS';
     responseHeaders['access-control-allow-headers'] = 'Content-Type, Authorization, X-API-Key';
-    responseHeaders['x-api-guardian-key-id'] = req.apiKey.id;
+    responseHeaders['x-api-guardian-key-id'] = keyId;
     responseHeaders['x-api-guardian-rate-limit'] = String(req.apiKey.rate_limit);
     responseHeaders['x-api-guardian-rate-window'] = String(req.apiKey.rate_limit_window);
     responseHeaders['x-request-id'] = req.requestId;
+    responseHeaders['x-cache'] = 'MISS';
+
+    // Content negotiation: gzip the upstream response when the API opts in
+    const gzipEnabled = shouldGzip(transformCfg, req, proxyRes.headers);
+    if (gzipEnabled) {
+      responseHeaders['content-encoding'] = 'gzip';
+      delete responseHeaders['content-length'];
+      responseHeaders.vary = (responseHeaders.vary ? responseHeaders.vary + ', ' : '') + 'Accept-Encoding';
+    }
 
     res.writeHead(proxyRes.statusCode, responseHeaders);
 
-    // Zero-copy streaming — no body buffering
-    proxyRes.pipe(res);
+    // Cacheable GETs are buffered (bounded) while still streamed to the client
+    let cacheChunks = null;
+    if (cacheableMethod && !gzipEnabled) {
+      cacheChunks = [];
+    }
+
+    let outStream = proxyRes;
+    if (gzipEnabled) {
+      outStream = proxyRes.pipe(zlib.createGzip());
+    }
+
+    outStream.on('data', (chunk) => {
+      if (cacheChunks) cacheChunks.push(chunk);
+    });
+    outStream.on('end', () => {
+      if (cacheChunks) {
+        const body = Buffer.concat(cacheChunks);
+        setResponseCache(keyId, method, targetPath, query, proxyRes.statusCode, proxyRes.headers, body)
+          .catch(() => {});
+      }
+    });
+
+    outStream.pipe(res);
 
     proxyRes.on('error', (err) => {
       logger.error('Proxy response stream error:', { error: err.message, requestId: req.requestId });
@@ -438,7 +600,10 @@ router.use(
   logApiUsage,
   (req, res) => {
     const { userId, apiId } = req.params;
-    const targetPath = req.params[0] || '';
+    const rawPath = req.params[0] || '';
+
+    // Continue an inbound W3C trace (if any) into this request's spans
+    const inboundCtx = extractContextFromHeaders(req.headers);
 
     // Validate that the API key belongs to the correct API
     if (req.apiKey.api_id !== apiId) {
@@ -457,9 +622,9 @@ router.use(
     }
 
     // Path traversal sanitization
-    if (!assertSafePath(targetPath)) {
+    if (!assertSafePath(rawPath)) {
       logger.logSecurityEvent('PATH_TRAVERSAL_BLOCKED', {
-        targetPath,
+        rawPath,
         ip: req.ip,
         requestId: req.requestId
       });
@@ -477,25 +642,55 @@ router.use(
         reason: 'obvious_internal_host',
         ip: req.ip
       });
+      audit({
+        userId: req.user?.id || null,
+        action: 'SECURITY_SSRF_BLOCKED',
+        resourceType: 'api',
+        resourceId: apiId,
+        details: { baseUrl, reason: 'obvious_internal_host' },
+        req
+      });
       return res.status(400).json({
         success: false,
         message: 'Invalid upstream target'
       });
     }
 
+    // Apply per-API transformation rules (path rewrites, query stripping).
+    // Rewrite patterns conventionally use a leading slash ('^/legacy'), but
+    // req.params[0] has none — normalize before rewriting, then strip it back.
+    const transformCfg = req.apiKey.transform_config || {};
+    const pathWithSlash = rawPath.startsWith('/') ? rawPath : `/${rawPath}`;
+    const targetPath = rewriteTargetPath(pathWithSlash, transformCfg).replace(/^\//, '');
+    const query = stripQueryParams(req.url.includes('?') ? req.url.split('?')[1] : '', transformCfg);
+
     // Build target URL
-    const query = req.url.includes('?') ? req.url.split('?')[1] : '';
     const targetUrl = `${baseUrl}/${targetPath}${query ? '?' + query : ''}`;
 
-    proxyRequest(req, res, targetUrl, baseUrl).catch((err) => {
-      logger.error('Proxy pipeline error:', err);
-      if (!res.headersSent) {
-        res.status(502).json({
-          success: false,
-          message: 'Bad Gateway'
-        });
-      }
-    });
+    withContext(inboundCtx, () =>
+      withSpan('proxy.request', {
+        'api.id': apiId,
+        'api.key_id': req.apiKey.id,
+        'api.base_url': baseUrl,
+        'http.method': req.method,
+        'http.target': `/${rawPath}`,
+        'http.request_id': req.requestId
+      }, (span) => {
+        proxyRequest(req, res, targetUrl, baseUrl, targetPath, query, transformCfg)
+          .then(() => {
+            if (span) span.setAttribute('http.status_code', String(res.statusCode));
+          })
+          .catch((err) => {
+            logger.error('Proxy pipeline error:', err);
+            if (!res.headersSent) {
+              res.status(502).json({
+                success: false,
+                message: 'Bad Gateway'
+              });
+            }
+          });
+      })
+    );
   }
 );
 
@@ -542,7 +737,8 @@ const handleUpgrade = async (req, socket, head) => {
 
     if (!keyData) {
       const keyQuery = `
-        SELECT ak.*, a.name as api_name, a.base_url, a.status as api_status, u.id as user_id
+        SELECT ak.*, a.name as api_name, a.base_url, a.status as api_status, u.id as user_id,
+               a.transform_config, a.mtls_config
         FROM api_keys ak
         JOIN apis a ON ak.api_id = a.id
         JOIN users u ON ak.user_id = u.id
@@ -610,7 +806,7 @@ const handleUpgrade = async (req, socket, head) => {
 const proxyWebSocket = (req, socket, head, targetUrl, baseUrl, keyData) => {
   const url = new URL(targetUrl);
   const httpModule = url.protocol === 'https:' || url.protocol === 'wss:' ? https : http;
-  const agent = getAgent(baseUrl);
+  const agent = getAgent(baseUrl, keyData.mtls_config);
 
   // Forward the client's upgrade headers verbatim (Sec-WebSocket-Key etc.)
   const headers = {};
@@ -639,12 +835,15 @@ const proxyWebSocket = (req, socket, head, targetUrl, baseUrl, keyData) => {
 
   upstreamReq.on('upgrade', (res, upstreamSocket, upstreamHead) => {
     logger.info('WebSocket upgraded', { targetUrl, keyId: keyData.id });
-    // Relay upstream 101 + headers to the client socket
+    // Relay upstream 101 + headers to the client socket.
+    // NOTE: `connection: Upgrade` and `upgrade: websocket` are REQUIRED for the
+    // client to accept the handshake, so they must NOT be stripped here even
+    // though they are hop-by-hop headers for normal HTTP proxying.
     const statusLine = `HTTP/1.1 101 ${res.statusMessage || 'Switching Protocols'}\r\n`;
     let headerBlock = statusLine;
     for (const [name, value] of Object.entries(res.headers)) {
       const lower = name.toLowerCase();
-      if (HOP_BY_HOP_HEADERS.has(lower)) continue;
+      if (lower === 'transfer-encoding' || lower === 'keep-alive' || lower === 'trailer' || lower === 'te') continue;
       headerBlock += `${name}: ${value}\r\n`;
     }
     headerBlock += '\r\n';

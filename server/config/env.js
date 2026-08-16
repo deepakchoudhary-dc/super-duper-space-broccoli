@@ -75,7 +75,19 @@ const config = {
     host: process.env.REDIS_HOST || 'localhost',
     port: int(process.env.REDIS_PORT, 6379),
     password: process.env.REDIS_PASSWORD || undefined,
-    connectTimeout: int(process.env.REDIS_CONNECT_TIMEOUT, 2000)
+    connectTimeout: int(process.env.REDIS_CONNECT_TIMEOUT, 2000),
+    // Redis HA via Sentinel: REDIS_SENTINELS="host1:26379,host2:26379,host3:26379"
+    // + REDIS_SENTINEL_MASTER=guardian-primary. When set, the client discovers
+    // the current primary instead of connecting to a fixed host:port.
+    sentinels: (process.env.REDIS_SENTINELS || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .map((pair) => {
+        const [host, port] = pair.split(':');
+        return { host, port: int(port, 26379) };
+      }),
+    sentinelMaster: process.env.REDIS_SENTINEL_MASTER || ''
   },
 
   // JWT
@@ -130,10 +142,54 @@ const config = {
     traceEnabled: process.env.TRACE_ENABLED !== 'false'
   },
 
+  // OpenTelemetry (full OTLP traces, off by default — see server/utils/tracing.js)
+  otel: {
+    enabled: process.env.OTEL_ENABLED === 'true',
+    endpoint: process.env.OTEL_EXPORTER_OTLP_ENDPOINT || 'http://localhost:4318',
+    serviceName: process.env.OTEL_SERVICE_NAME || 'api-guardian'
+  },
+
   // Alerting
   alerts: {
     rateLimitEmail: process.env.RATE_LIMIT_ALERT_EMAIL !== 'false',
-    rateLimitAlertCooldownMs: int(process.env.RATE_LIMIT_ALERT_COOLDOWN, 15 * 60 * 1000)
+    rateLimitAlertCooldownMs: int(process.env.RATE_LIMIT_ALERT_COOLDOWN, 15 * 60 * 1000),
+    securityAlertEmail: process.env.SECURITY_ALERT_EMAIL !== 'false',
+    securityAlertCooldownMs: int(process.env.SECURITY_ALERT_COOLDOWN, 15 * 60 * 1000)
+  },
+
+  // Audit logging
+  audit: {
+    enabled: process.env.AUDIT_ENABLED !== 'false',
+    retentionDays: int(process.env.AUDIT_RETENTION_DAYS, 90)
+  },
+
+  // Response caching (gateway cache layer)
+  caching: {
+    enabled: process.env.CACHE_ENABLED !== 'false',
+    ttlSeconds: int(process.env.CACHE_TTL_SECONDS, 60),
+    maxBodyBytes: int(process.env.CACHE_MAX_BODY_BYTES, 512 * 1024)
+  },
+
+  // Webhooks (GitHub secret scanning, etc.)
+  webhooks: {
+    githubSecret: process.env.GITHUB_WEBHOOK_SECRET || '',
+    enabled: process.env.WEBHOOKS_ENABLED !== 'false'
+  },
+
+  // OAuth2 / OIDC single sign-on
+  oidc: {
+    enabled: process.env.OIDC_ENABLED === 'true',
+    issuer: process.env.OIDC_ISSUER || '',
+    clientId: process.env.OIDC_CLIENT_ID || '',
+    clientSecret: process.env.OIDC_CLIENT_SECRET || '',
+    redirectUri: process.env.OIDC_REDIRECT_URI || '',
+    scopes: (process.env.OIDC_SCOPES || 'openid profile email').split(' ').filter(Boolean)
+  },
+
+  // Multi-tenancy
+  orgs: {
+    enabled: process.env.ORGS_ENABLED !== 'false',
+    defaultRole: process.env.ORGS_DEFAULT_ROLE || 'member'
   },
 
   // Email

@@ -8,6 +8,8 @@ const { authenticateToken, checkResourceOwnership } = require('../middleware/aut
 const { sendEmail } = require('../utils/email');
 const { generateSecureApiKey, hashApiKey } = require('../utils/crypto');
 const { deleteCache } = require('../config/redis');
+const { clearResponseCacheForKey } = require('../utils/cache');
+const { resetRateLimit } = require('../utils/rateLimiter');
 const logger = require('../utils/logger');
 
 const router = express.Router();
@@ -18,7 +20,7 @@ const createKeyValidation = [
   body('description').optional({ checkFalsy: true, nullable: true }).trim().isLength({ max: 1000 }),
   body('apiId').notEmpty().withMessage('Please select an API'),
   body('permissions').optional({ checkFalsy: true, nullable: true }),
-  body('rateLimit').optional({ checkFalsy: true, nullable: true }).isInt({ min: 1, max: 100000 }),
+  body('rateLimit').optional({ checkFalsy: true, nullable: true }).isInt({ min: 1, max: 100000000 }),
   body('rateLimitWindow').optional({ checkFalsy: true, nullable: true }).isInt({ min: 1, max: 86400 }),
   // Multi-tier quota limits (0 = disabled)
   body('burstLimit').optional({ checkFalsy: true, nullable: true }).isInt({ min: 0, max: 100000 }),
@@ -31,7 +33,7 @@ const updateKeyValidation = [
   body('name').optional().trim().notEmpty().withMessage('Key name cannot be empty').isLength({ min: 1, max: 255 }),
   body('description').optional({ checkFalsy: true, nullable: true }).trim().isLength({ max: 1000 }),
   body('permissions').optional({ checkFalsy: true, nullable: true }),
-  body('rateLimit').optional({ checkFalsy: true, nullable: true }).isInt({ min: 1, max: 100000 }),
+  body('rateLimit').optional({ checkFalsy: true, nullable: true }).isInt({ min: 1, max: 100000000 }),
   body('rateLimitWindow').optional({ checkFalsy: true, nullable: true }).isInt({ min: 1, max: 86400 }),
   body('burstLimit').optional({ checkFalsy: true, nullable: true }).isInt({ min: 0, max: 100000 }),
   body('hourlyLimit').optional({ checkFalsy: true, nullable: true }).isInt({ min: 0, max: 10000000 }),
@@ -105,7 +107,7 @@ router.get('/', authenticateToken, async (req, res) => {
              (SELECT COUNT(*) FROM api_usage_logs WHERE api_key_id = ak.id AND created_at >= CURRENT_DATE - INTERVAL '30 days') as usage_last_30_days
       FROM api_keys ak
       JOIN apis a ON ak.api_id = a.id
-      WHERE ak.user_id = $1
+      WHERE (ak.user_id = $1 OR a.org_id IN (SELECT org_id FROM organization_members WHERE user_id = $1))
     `;
     
     const queryParams = [userId];
@@ -139,7 +141,7 @@ router.get('/', authenticateToken, async (req, res) => {
       SELECT COUNT(*) 
       FROM api_keys ak
       JOIN apis a ON ak.api_id = a.id
-      WHERE ak.user_id = $1
+      WHERE (ak.user_id = $1 OR a.org_id IN (SELECT org_id FROM organization_members WHERE user_id = $1))
     `;
     const countParams = [userId];
     let countParamCount = 1;
@@ -331,8 +333,12 @@ router.post('/', authenticateToken, createKeyValidation, async (req, res) => {
       expiresAt 
     } = req.body;
 
-    // Verify that the API belongs to the user
-    const apiQuery = 'SELECT name, base_url FROM apis WHERE id = $1 AND user_id = $2';
+    // Verify that the API belongs to the user or their organization
+    const apiQuery = `
+      SELECT name, base_url FROM apis a
+      WHERE a.id = $1
+        AND (a.user_id = $2 OR a.org_id IN (SELECT org_id FROM organization_members WHERE user_id = $2))
+    `;
     const apiResult = await pool.query(apiQuery, [apiId, userId]);
 
     if (apiResult.rows.length === 0) {
@@ -652,12 +658,14 @@ router.post('/:id/revoke', authenticateToken, checkResourceOwnership('api_key'),
     const apiNameResult = await pool.query('SELECT name FROM apis WHERE id = $1', [key.api_id]);
     const apiName = apiNameResult.rows.length > 0 ? apiNameResult.rows[0].name : 'Unknown';
 
-    // Clear cached key
+    // Clear cached key + cached responses + rate-limit state
     try {
       await deleteCache(`api_key_cache:${key.key_hash}`);
     } catch (redisError) {
       logger.error('Failed to clear key cache:', redisError);
     }
+    await clearResponseCacheForKey(keyId);
+    await resetRateLimit(`api_key:${keyId}`);
 
     // Log audit event
     await logAuditEvent(userId, 'API_KEY_REVOKED', keyId, {
@@ -735,12 +743,14 @@ router.post('/:id/regenerate', authenticateToken, checkResourceOwnership('api_ke
     const apiNameResult = await pool.query('SELECT name FROM apis WHERE id = $1', [key.api_id]);
     const apiName = apiNameResult.rows.length > 0 ? apiNameResult.rows[0].name : 'Unknown';
 
-    // Clear old cached key
+    // Clear old cached key + cached responses + rate-limit state
     try {
       await deleteCache(`api_key_cache:${oldKeyHash}`);
     } catch (redisError) {
       logger.error('Failed to clear old key cache:', redisError);
     }
+    await clearResponseCacheForKey(keyId);
+    await resetRateLimit(`api_key:${keyId}`);
 
     // Log audit event
     await logAuditEvent(userId, 'API_KEY_REGENERATED', keyId, {
@@ -774,6 +784,153 @@ router.post('/:id/regenerate', authenticateToken, checkResourceOwnership('api_ke
       success: false,
       message: 'Failed to regenerate API key'
     });
+  }
+});
+
+// ============================================================================
+// ROTATE API KEY — issue a replacement, retire the old one (with grace period)
+// ============================================================================
+
+/**
+ * @openapi
+ * /api/keys/{id}/rotate:
+ *   post:
+ *     summary: Rotate an API key (issues a replacement, retires the old one)
+ *     tags: [API Keys]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               gracePeriodMinutes: { type: integer, minimum: 0, default: 0, description: Keep the old key valid for a zero-downtime swap }
+ *     responses:
+ *       201:
+ *         description: Replacement key issued; old key retired
+ *       404:
+ *         description: Key not found
+ */
+router.post('/:id/rotate', authenticateToken, checkResourceOwnership('api_key'), async (req, res) => {
+  try {
+    const keyId = req.params.id;
+    const userId = req.user.id;
+    const graceMinutes = Math.max(0, Math.min(43200, parseInt(req.body.gracePeriodMinutes, 10) || 0));
+
+    // Fetch the current key (must be active)
+    const keyQuery = `
+      SELECT ak.*, a.name as api_name
+      FROM api_keys ak
+      JOIN apis a ON ak.api_id = a.id
+      WHERE ak.id = $1 AND ak.user_id = $2
+    `;
+    const keyResult = await pool.query(keyQuery, [keyId, userId]);
+    if (keyResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'API key not found' });
+    }
+    const currentKey = keyResult.rows[0];
+
+    if (currentKey.status !== 'active') {
+      return res.status(400).json({ success: false, message: 'Only active keys can be rotated' });
+    }
+
+    // Issue a replacement key with the same configuration (never reuse the old hash)
+    const { apiKey, keyPrefix, keyHash } = generateSecureApiKey();
+    const insertQuery = `
+      INSERT INTO api_keys (
+        api_id, user_id, key_hash, key_prefix, name, description,
+        permissions, rate_limit, rate_limit_window, expires_at,
+        burst_limit, hourly_limit, daily_limit
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+      RETURNING id
+    `;
+    const newKeyResult = await pool.query(insertQuery, [
+      currentKey.api_id,
+      userId,
+      keyHash,
+      keyPrefix,
+      currentKey.name,
+      currentKey.description || null,
+      JSON.stringify(currentKey.permissions || { endpoints: [{ path: '*', methods: ['GET'] }] }),
+      currentKey.rate_limit || 1000,
+      currentKey.rate_limit_window || 3600,
+      currentKey.expires_at || null,
+      currentKey.burst_limit || 0,
+      currentKey.hourly_limit || 0,
+      currentKey.daily_limit || 0
+    ]);
+    const newKeyId = newKeyResult.rows[0].id;
+
+    // Retire the old key: grace period keeps it valid until expiry, else revoke now
+    if (graceMinutes > 0) {
+      await pool.query(
+        `UPDATE api_keys
+         SET expires_at = GREATEST(COALESCE(expires_at, CURRENT_TIMESTAMP), CURRENT_TIMESTAMP + MAKE_INTERVAL(mins => $1)),
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = $2`,
+        [graceMinutes, keyId]
+      );
+    } else {
+      await pool.query(
+        `UPDATE api_keys SET status = 'revoked', updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+        [keyId]
+      );
+    }
+
+    // Invalidate cached state for the retired key
+    try {
+      await deleteCache(`api_key_cache:${currentKey.key_hash}`);
+    } catch (redisError) {
+      logger.error('Failed to clear key cache:', redisError);
+    }
+    await clearResponseCacheForKey(keyId);
+    await resetRateLimit(`api_key:${keyId}`);
+
+    // Audit trail
+    await logAuditEvent(userId, 'API_KEY_ROTATED', keyId, {
+      name: currentKey.name,
+      apiName: currentKey.api_name,
+      newKeyId,
+      gracePeriodMinutes: graceMinutes
+    }, req);
+    await logAuditEvent(userId, 'API_KEY_CREATED', newKeyId, {
+      name: currentKey.name,
+      apiId: currentKey.api_id,
+      apiName: currentKey.api_name,
+      via: 'rotation'
+    }, req);
+
+    logger.info('API key rotated successfully', { userId, keyId, newKeyId, gracePeriodMinutes: graceMinutes });
+
+    res.status(201).json({
+      success: true,
+      message: graceMinutes > 0
+        ? `API key rotated. The old key remains valid for ${graceMinutes} minute(s).`
+        : 'API key rotated successfully',
+      data: {
+        key: {
+          id: newKeyId,
+          name: currentKey.name,
+          apiKey: apiKey, // shown once — never stored
+          keyPrefix,
+          apiId: currentKey.api_id,
+          apiName: currentKey.api_name,
+          permissions: currentKey.permissions,
+          rateLimit: currentKey.rate_limit,
+          rateLimitWindow: currentKey.rate_limit_window,
+          burstLimit: currentKey.burst_limit,
+          hourlyLimit: currentKey.hourly_limit,
+          dailyLimit: currentKey.daily_limit,
+          status: 'active'
+        },
+        retiredKey: { id: keyId, status: graceMinutes > 0 ? 'active (until expiry)' : 'revoked' }
+      }
+    });
+  } catch (error) {
+    logger.error('Rotate API key error:', error);
+    res.status(500).json({ success: false, message: 'Failed to rotate API key' });
   }
 });
 
@@ -821,6 +978,8 @@ router.delete('/:id', authenticateToken, checkResourceOwnership('api_key'), asyn
     } catch (redisError) {
       logger.error('Failed to clear key cache:', redisError);
     }
+    await clearResponseCacheForKey(keyId);
+    await resetRateLimit(`api_key:${keyId}`);
 
     // Log audit event
     await logAuditEvent(userId, 'API_KEY_DELETED', keyId, {

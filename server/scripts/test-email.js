@@ -20,18 +20,18 @@ async function testEmail() {
         }
       });
       
-      console.log('✅ Email sent successfully!');
+      console.log('Email sent successfully!');
       console.log('Message ID:', result.messageId);
       console.log('Preview URL:', result.preview);
       
       // Also log the preview URL which we can use to see the email
       if (result.preview) {
-        console.log('📧 View the sent email at:', result.preview);
+        console.log('View the sent email at:', result.preview);
       }
     }
     
   } catch (error) {
-    console.error('❌ Email test failed:', error.message);
+    console.error('Email test failed:', error.message);
     console.error('Stack:', error.stack);
   }
 }

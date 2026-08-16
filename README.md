@@ -1,4 +1,4 @@
-# 🛡️ API Guardian — High-Security API Access & Governance Hub
+# API Guardian — High-Security API Access & Governance Hub
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Node.js Version](https://img.shields.io/badge/node-%3E%3D18.0.0-brightgreen.svg)](https://nodejs.org/)
@@ -9,37 +9,37 @@
 
 ---
 
-## 🌟 Core Features
+## Core Features
 
-- 🔐 **Zero-Trust API Key Cryptography**: Plaintext API keys are **never stored** in the database. Keys are cryptographically hashed using SHA-256 with timing-safe verification, guaranteeing zero exposure even in the event of database exfiltration.
-- 🔄 **JWT Token Type Isolation & Rotation Families**:
+- **Zero-Trust API Key Cryptography**: Plaintext API keys are **never stored** in the database. Keys are cryptographically hashed using SHA-256 with timing-safe verification, guaranteeing zero exposure even in the event of database exfiltration.
+- **JWT Token Type Isolation & Rotation Families**:
   - Separate cryptographic secrets for Access (`JWT_ACCESS_SECRET`) and Refresh (`JWT_REFRESH_SECRET`) tokens.
   - Refresh token family rotation with automated stolen token replay detection and instant family revocation.
   - Instant Redis token blacklisting on logout.
-- ⚡ **High-Performance Streaming Proxy**:
+- **High-Performance Streaming Proxy**:
   - Keep-Alive HTTP/HTTPS connection pooling (`Map<baseUrl, Agent>`).
   - Zero-copy streaming pipeline (`req.pipe(proxyReq)` / `proxyRes.pipe(res)`) eliminating memory buffering bottlenecks.
   - **WebSocket / SSE upgrade proxying** with full API-key auth, rate limiting, and SSRF checks.
   - **Header sanitization**: dashboard JWTs, cookies, and raw API keys are never forwarded upstream.
   - **SSRF protection**: upstream targets are validated against private/link-local/metadata ranges at registration and per-request.
-- ⚖️ **Multi-Tier Atomic Rate Limiting**:
+- **Multi-Tier Atomic Rate Limiting**:
   - Redis Lua sliding-window with **burst (per-second), hourly, and daily quota tiers** per key — atomic, race-free.
   - In-memory fallback when Redis is unavailable (graceful degradation).
   - `RateLimit-Policy` / `X-RateLimit-*` headers per the IETF draft.
-- 🩺 **Upstream Resilience (Circuit Breaker + Health Checks)**:
+- **Upstream Resilience (Circuit Breaker + Health Checks)**:
   - Per-upstream three-state circuit breaker (closed/open/half-open) with passive failure counting.
   - Active `/health` probing with automatic unhealthy-node ejection.
   - 503 fail-fast when an upstream circuit is open.
-- 🛡️ **WAF (Web Application Firewall)**:
+- **WAF (Web Application Firewall)**:
   - SQL injection, XSS, path traversal, command injection, and NoSQL injection detection on all API + proxy traffic.
   - Blocked payloads are audit-logged as security events.
-- 📈 **Prometheus Metrics Endpoint** (`/metrics`):
+- **Prometheus Metrics Endpoint** (`/metrics`):
   - Request counters, latency histograms, rate-limit rejections, WAF blocks, upstream failures, circuit states, Redis availability.
-- 📊 **Real-Time Analytics & Monitoring**:
+- **Real-Time Analytics & Monitoring**:
   - Interactive dashboards with latency graphs, throughput metrics (RPS), status code distributions, and error tracking.
   - Per-API and per-key usage telemetry.
   - **Real alert data** — elevated error rates, expiring keys, and rate-limit pressure (no more mock endpoints).
-- 🛡️ **Defensive Hardening**:
+- **Defensive Hardening**:
   - Strict Content Security Policy (CSP), HTTP Strict Transport Security (HSTS), XSS protection, and frame-ancestors blocking via Helmet.
   - Granular rate limiting per IP, per user, and per API key.
   - Account lockout protection against brute-force attacks.
@@ -47,14 +47,26 @@
   - **Consistent password policy** (8+ chars with complexity) enforced at registration and reset.
   - Email-change flow now issues a fresh verification token.
   - Pagination clamped to prevent resource exhaustion.
-- 🔔 **Alerting Engine**: rate-limit-exceeded and security events trigger cooldown-throttled email notifications to key owners.
-- ⚙️ **Self-Healing Database & Graceful Fallbacks**:
+- **Alerting Engine**: rate-limit-exceeded and security events trigger cooldown-throttled email notifications to key owners.
+- **Immutable Audit Trail** (append-only, DB-enforced): every security event (WAF blocks, rate-limit hits, SSRF blocks, circuit opens, leaked-key revocations) and every sensitive mutation lands in `audit_logs`, queryable by admins via `GET /api/admin/audit-logs` with retention-based purging.
+- **Response Caching**: Redis-backed GET/HEAD cache per API key with upstream `Cache-Control` awareness, `X-Cache: HIT/MISS` headers, bounded body size, and instant invalidation when a key is revoked/rotated. Graceful in-memory fallback without Redis.
+- **Request/Response Transformation Engine**: per-API path rewrites, request/response header rules, query-parameter stripping, CORS policy, and upstream response gzip — configured via `PATCH /api/apis/:id/transform`.
+- **API Key Rotation**: `POST /api/keys/:id/rotate` issues a replacement key with the same limits/permissions and retires the old one — immediately or after a zero-downtime grace period.
+- **Leaked-Key Auto-Revocation**: a GitHub secret-scanning webhook (`POST /api/webhooks/github-secret-scanning`) verifies a shared token, hashes reported tokens, revokes matches instantly, purges caches, and alerts the owner.
+- **OAuth2 / OIDC Single Sign-On**: PKCE (S256) authorization-code flow against any OIDC provider (Google, GitHub, Azure, Okta, Keycloak...), user auto-linking by subject/email, and issuance of the same isolated JWT pair.
+- **mTLS Upstream Auth**: per-API client certificates presented to upstreams (`mtls_config` on the API record).
+- **Multi-Tenancy (Organizations)**: organizations with owner/admin/member roles, membership management, and org-scoped APIs and keys.
+- **Full OpenTelemetry (opt-in)**: set `OTEL_ENABLED=true` to register the OTel Node SDK and export W3C traces over OTLP/HTTP to any collector (Jaeger, Tempo, SigNoz). Proxy requests, cache hits/misses, WAF blocks and rate-limit rejections are recorded as spans/events; the SDK is never loaded when disabled (zero overhead).
+- **Load Testing & CI Performance Gate**: k6 suites for smoke, sustained load (p95 < 500ms gate), cache HIT ratio and rate-limit behavior, wired into GitHub Actions as a `perf-gate` job with hard thresholds.
+- **Operations Tooling**: PgBouncer connection-pooler config, Redis HA via Sentinel (3 nodes + 3 sentinels with auto-failover and client discovery), and PostgreSQL backup/restore scripts with retention and optional S3 offload.
+- **Starter SDK & CLI**: a dependency-free Node SDK (`@api-guardian/sdk`) with retries/backoff, rate-limit awareness and typed errors, plus a zero-dependency CLI (`guardian apis|keys|orgs|audit|proxy`).
+- **Self-Healing Database & Graceful Fallbacks**:
   - Automatic idempotent database schema migrations on startup (including legacy-table column backfills).
   - Graceful Redis fail-open fallback ensuring uptime even if the cache layer is down.
 
 ---
 
-## 🏗️ Architecture Overview
+## Architecture Overview
 
 ```text
                                  ┌─────────────────────────┐
@@ -84,7 +96,7 @@
 
 ---
 
-## 📂 Project Structure
+## Project Structure
 
 ```text
 super-duper-space-broccoli/
@@ -101,9 +113,15 @@ super-duper-space-broccoli/
 │   ├── database/               # Database SQL schema & init scripts
 │   ├── middleware/             # Auth, Rate Limiting, RBAC & Error Handlers
 │   ├── routes/                 # Auth, APIs, Keys, Analytics, Proxy, Settings routes
-│   ├── utils/                  # Cryptographic utilities (SHA-256), logger, email
+│   ├── utils/                  # Cryptographic utilities, logger, email, tracing
 │   ├── index.js                # Server entry point & graceful shutdown
 │   └── package.json
+├── client/                     # React SPA (dashboard, orgs, admin audit UI)
+├── scripts/
+│   ├── k6/                     # Load-test suites + CI perf-gate bootstrap
+│   └── ops/                    # PgBouncer, Redis HA (sentinel), backup/restore
+├── sdk/node/                   # Official Node.js SDK (@api-guardian/sdk)
+├── cli/                        # Zero-dependency CLI (@api-guardian/cli)
 ├── docker-compose.yml          # Multi-container orchestration (DB, Redis, Server, Client)
 ├── .gitignore                  # Strict anti-leak protection rules
 ├── package.json                # Root automation scripts
@@ -112,7 +130,7 @@ super-duper-space-broccoli/
 
 ---
 
-## 🚀 Quick Start Guide
+## Quick Start Guide
 
 ### Prerequisites
 - **Node.js**: `v18.0.0+` (LTS recommended)
@@ -177,14 +195,14 @@ Start both backend and frontend concurrently:
 npm run dev
 ```
 
-- 🌐 **Frontend UI**: [http://localhost:3000](http://localhost:3000)
-- 🔌 **Backend API**: [http://localhost:5000](http://localhost:5000)
-- 📖 **Interactive API Docs (Swagger)**: [http://localhost:5000/api/docs](http://localhost:5000/api/docs)
-- 💓 **Health Check**: [http://localhost:5000/health](http://localhost:5000/health)
+- **Frontend UI**: [http://localhost:3000](http://localhost:3000)
+- **Backend API**: [http://localhost:5000](http://localhost:5000)
+- **Interactive API Docs (Swagger)**: [http://localhost:5000/api/docs](http://localhost:5000/api/docs)
+- **Health Check**: [http://localhost:5000/health](http://localhost:5000/health)
 
 ---
 
-## 🐳 Docker Deployment
+## Docker Deployment
 
 To launch the complete isolated production-like environment with PostgreSQL, Redis, Node.js API Gateway, and React client:
 
@@ -201,7 +219,7 @@ docker-compose down
 
 ---
 
-## 🛡️ Anti-Leak & Security Guidelines
+## Anti-Leak & Security Guidelines
 
 To ensure secrets, credentials, and sensitive assets are never leaked:
 
@@ -222,7 +240,7 @@ To ensure secrets, credentials, and sensitive assets are never leaked:
 
 ---
 
-## 📜 Available NPM Scripts
+## Available NPM Scripts
 
 | Command | Description |
 | :--- | :--- |
@@ -234,16 +252,21 @@ To ensure secrets, credentials, and sensitive assets are never leaked:
 | `npm test` | Runs both backend Jest tests and client test suite |
 | `npm run test:server` | Runs backend unit tests (46+ tests: crypto, WAF, rate limiter, SSRF, circuit breaker, config) |
 | `npm run test:integration` | Runs full-stack integration tests (requires Postgres + Redis; `RUN_INTEGRATION=true`) |
+| `npm run test:sdk` | Runs the Node SDK test suite (`node --test`) |
+| `npm run test:cli` | Runs the CLI test suite (`node --test`) |
+| `npm run load:test` | Runs the k6 load test (`scripts/k6/load.js`) |
+| `npm run backup:db` | Runs the PostgreSQL backup script (`scripts/ops/backup.sh`) |
 | `npm run docker:up` | Starts all Docker containers via `docker-compose` |
 | `npm run docker:down`| Tears down all Docker containers and networks |
 
-## 📈 Observability
+## Observability
 
 - **Prometheus**: scrape `GET /metrics` (default). Metrics include `http_requests_total{method,path,status}`, `http_request_duration_seconds`, `gateway_rate_limit_exceeded_total{key_id,tier}`, `gateway_waf_blocked_total{category}`, `gateway_upstream_failures_total`, `gateway_circuit_breaker_state{api_id}`, `gateway_redis_available`, and Node.js process metrics.
 - **Deep health check**: `GET /health` reports `database` and `redis` connectivity (returns 503 when degraded).
 - **Tracing**: W3C `traceparent` is propagated to upstreams when present, and every response carries `X-Request-Id`.
+- **OpenTelemetry (opt-in)**: with `OTEL_ENABLED=true` the gateway registers the OTel Node SDK and exports spans over OTLP/HTTP (`OTEL_EXPORTER_OTLP_ENDPOINT`, default `http://localhost:4318`) to Jaeger/Tempo/SigNoz. Proxy requests carry `proxy.request` spans with cache hit/miss events; WAF blocks and rate-limit rejections emit `waf.block` / `rate_limit.exceeded` events. Disabled by default — the SDK is never loaded, so there is zero runtime cost until you opt in.
 
-## 🛡️ Security Model
+## Security Model
 
 | Control | Implementation |
 | :--- | :--- |
@@ -256,8 +279,20 @@ To ensure secrets, credentials, and sensitive assets are never leaked:
 | Upstream resilience | Circuit breaker + active health checks |
 | Container | Non-root `node` user, HEALTHCHECK, production deps only |
 | CI/CD | GitHub Actions: unit + integration tests against real Postgres/Redis, client build |
+| Audit trail | Append-only `audit_logs` with DB-enforced immutability triggers; admin query API + retention purge |
+| Response caching | Redis + memory fallback, per-key GET/HEAD cache, `Cache-Control` aware, invalidated on revoke |
+| Transformations | Per-API path rewrites, header rules, query stripping, CORS, gzip |
+| Key rotation | Replacement key issued with identical config; old key retired instantly or after grace period |
+| Leak detection | GitHub secret-scanning webhook (shared-secret verified) auto-revokes leaked keys |
+| SSO | OIDC authorization-code + PKCE with user linking; JWT pair reuse |
+| mTLS | Per-API client certificate authentication toward upstreams |
+| Multi-tenancy | Organizations with owner/admin/member roles; org-scoped APIs and keys |
+| Tracing | W3C traceparent propagation + opt-in full OpenTelemetry (OTLP spans/events) |
+| Load testing | k6 suites with hard latency/error thresholds in CI (`perf-gate` job) |
+| Ops | PgBouncer pooler config, Redis Sentinel HA with client discovery, PG backup/restore |
+| SDK/CLI | Retrying Node SDK with rate-limit backoff; zero-dep CLI for APIs, keys, orgs, audit |
 
 ---
 
-## 📄 License
+## License
 This project is licensed under the **MIT License**.

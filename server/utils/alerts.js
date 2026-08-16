@@ -2,9 +2,9 @@
  * Alerting Engine
  * ---------------
  * Turns gateway events into developer notifications:
- *  - RATE_LIMIT_EXCEEDED → email to the key owner (cooldown throttled so a
+ *  - RATE_LIMIT_EXCEEDED: email to the key owner (cooldown throttled so a
  *    burst doesn't spam the inbox).
- *  - Security events (circuit opened, suspicious activity) → audit + email.
+ *  - Security events (circuit opened, suspicious activity): audit + email.
  *
  * The email templates already exist in utils/email.js; this wires them up.
  */
@@ -18,8 +18,8 @@ const logger = require('./logger');
 // across replicas but this keeps the dependency surface small)
 const lastNotified = new Map();
 
-const withinCooldown = (key) => {
-  const cooldown = config.alerts.rateLimitAlertCooldownMs;
+const withinCooldown = (key, cooldownMs) => {
+  const cooldown = cooldownMs || config.alerts.rateLimitAlertCooldownMs;
   const last = lastNotified.get(key) || 0;
   if (Date.now() - last < cooldown) return true;
   lastNotified.set(key, Date.now());
@@ -34,7 +34,7 @@ const notifyRateLimitExceeded = async (keyData, currentUsage) => {
   if (!config.alerts.rateLimitEmail) return;
 
   const cooldownKey = `rl:${keyData.id}`;
-  if (withinCooldown(cooldownKey)) return;
+  if (withinCooldown(cooldownKey, config.alerts.rateLimitAlertCooldownMs)) return;
 
   try {
     const userResult = await pool.query('SELECT email, first_name FROM users WHERE id = $1', [keyData.user_id]);
@@ -68,8 +68,15 @@ const notifyRateLimitExceeded = async (keyData, currentUsage) => {
 
 /**
  * Generic security alert (email only when user settings allow; no-op otherwise).
+ * Cooldown-throttled per subject + user so a burst of blocked requests
+ * (WAF, circuit trips) does not spam the inbox.
  */
 const notifySecurityAlert = async (userId, subject, details) => {
+  if (!config.alerts.securityAlertEmail) return;
+
+  const cooldownKey = `sec:${userId}:${subject}`;
+  if (withinCooldown(cooldownKey, config.alerts.securityAlertCooldownMs)) return;
+
   try {
     const userResult = await pool.query(
       "SELECT email, first_name, COALESCE(settings, '{}'::jsonb) AS settings FROM users WHERE id = $1",
@@ -90,6 +97,8 @@ const notifySecurityAlert = async (userId, subject, details) => {
         <p>If you did not perform this action, review your account security immediately.</p>
       `
     });
+
+    logger.info('Security alert sent', { userId, subject });
   } catch (error) {
     logger.error('Failed to send security alert:', error.message);
   }

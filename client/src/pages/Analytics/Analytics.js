@@ -17,12 +17,9 @@ import {
   TableCell,
   TableContainer,
   TableHead,
-  TableRow,
-  IconButton,
-  Tooltip
+  TableRow
 } from '@mui/material';
 import {
-  DateRange,
   Download,
   Refresh,
   TrendingUp,
@@ -48,7 +45,7 @@ import {
   BarElement
 } from 'chart.js';
 import dayjs from 'dayjs';
-import api, { analyticsAPI, apiAPI } from '../../services/api';
+import { analyticsAPI, apiAPI } from '../../services/api';
 
 ChartJS.register(
   CategoryScale,
@@ -105,6 +102,7 @@ const Analytics = () => {
 
   useEffect(() => {
     fetchAnalyticsData();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dateRange, selectedAPI]);
   const fetchAPIs = async () => {
     try {

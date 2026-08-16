@@ -2,7 +2,6 @@ import React, { useState, useEffect } from 'react';
 import {
   Box,
   Typography,
-  Paper,
   Grid,
   Card,
   CardContent,
@@ -28,16 +27,12 @@ import {
   MenuItem,
   Accordion,
   AccordionSummary,
-  AccordionDetails,
-  IconButton,
-  Tooltip
+  AccordionDetails
 } from '@mui/material';
 import {
   Settings as SettingsIcon,
   Security as SecurityIcon,
   Notifications as NotificationsIcon,
-  Palette as PaletteIcon,
-  Language as LanguageIcon,
   Storage as StorageIcon,
   Shield as ShieldIcon,
   Email as EmailIcon,
@@ -45,9 +40,7 @@ import {
   Webhook as WebhookIcon,
   Save as SaveIcon,
   Restore as RestoreIcon,
-  Delete as DeleteIcon,
   ExpandMore as ExpandMoreIcon,
-  Info as InfoIcon,
   Warning as WarningIcon
 } from '@mui/icons-material';
 import { toast } from 'react-toastify';
@@ -56,7 +49,7 @@ import apiService from '../../services/api';
 import ConfirmDialog from '../../components/common/ConfirmDialog';
 
 const Settings = () => {
-  const { user } = useAuth();
+  useAuth();
   const [settings, setSettings] = useState({
     // General Settings
     language: 'en',

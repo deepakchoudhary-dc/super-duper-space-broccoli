@@ -12,6 +12,7 @@ const logger = require('./utils/logger');
 const errorHandler = require('./middleware/errorHandler');
 const { wafMiddleware } = require('./utils/waf');
 const metrics = require('./utils/metrics');
+const { initTracing, recordEvent } = require('./utils/tracing');
 
 // Route imports
 const authRoutes = require('./routes/auth');
@@ -22,6 +23,10 @@ const proxyRoutes = require('./routes/proxy');
 const analyticsRoutes = require('./routes/analytics');
 const docsRoutes = require('./routes/docs');
 const settingsRoutes = require('./routes/settings');
+const adminRoutes = require('./routes/admin');
+const orgRoutes = require('./routes/orgs');
+const webhookRoutes = require('./routes/webhooks');
+const oidcRoutes = require('./routes/oidc');
 
 const app = express();
 const PORT = config.port;
@@ -144,6 +149,12 @@ app.use((req, res, next) => {
     userAgent: req.get('User-Agent'),
     timestamp: new Date().toISOString()
   });
+  recordEvent('http.request', {
+    method: req.method,
+    path: req.url,
+    request_id: req.requestId,
+    trace_id: req.headers['traceparent']
+  });
   next();
 });
 
@@ -198,12 +209,16 @@ app.get(config.observability.metricsPath, async (req, res) => {
 // ============================================================================
 
 app.use('/api/auth', authRoutes);
+app.use('/api/auth', oidcRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/apis', apiRoutes);
 app.use('/api/keys', keyRoutes);
 app.use('/api/analytics', analyticsRoutes);
 app.use('/api/docs', docsRoutes);
 app.use('/api/settings', settingsRoutes);
+app.use('/api/orgs', orgRoutes);
+app.use('/api/admin', adminRoutes);
+app.use('/api/webhooks', webhookRoutes);
 
 // Proxy routes (should be last to catch all other routes)
 app.use('/proxy', proxyRoutes);
@@ -242,6 +257,9 @@ let server;
 
 async function startServer() {
   try {
+    // OpenTelemetry (no-op unless OTEL_ENABLED=true)
+    await initTracing();
+
     // Connect to databases
     await connectDB();
     await connectRedis();
@@ -249,14 +267,14 @@ async function startServer() {
     server = app.listen(PORT, () => {
       logger.info(`Server running on port ${PORT}`);
       // eslint-disable-next-line no-console
-      console.log(`🚀 API Guardian server running on port ${PORT}`);
+      console.log(`API Guardian server running on port ${PORT}`);
       // eslint-disable-next-line no-console
-      console.log(`📊 Health check: http://localhost:${PORT}/health`);
+      console.log(`Health check: http://localhost:${PORT}/health`);
       // eslint-disable-next-line no-console
-      console.log(`📈 Metrics: http://localhost:${PORT}${config.observability.metricsPath}`);
+      console.log(`Metrics: http://localhost:${PORT}${config.observability.metricsPath}`);
       if (config.env !== 'production') {
         // eslint-disable-next-line no-console
-        console.log(`📖 API Docs: http://localhost:${PORT}/api/docs`);
+        console.log(`API Docs: http://localhost:${PORT}/api/docs`);
       }
     });
 
@@ -338,6 +356,11 @@ process.on('uncaughtException', (error) => {
   gracefulShutdown('uncaughtException');
 });
 
-startServer();
+// Only auto-start when run directly (node server/index.js). When required from
+// tests (jest resetModules) or other modules, the caller owns the listener, so
+// we must not boot a second fixed-PORT server that never gets closed.
+if (require.main === module) {
+  startServer();
+}
 
 module.exports = app;

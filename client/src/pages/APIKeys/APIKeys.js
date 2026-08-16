@@ -24,8 +24,6 @@ import {
   InputLabel,
   Select,
   MenuItem,
-  Alert,
-  Tooltip,
   Menu,
   MenuItem as MenuItemComponent,
   CircularProgress,
@@ -39,7 +37,6 @@ import {
   Visibility,
   VisibilityOff,
   ContentCopy,
-  FilterList,
   Search,
   Key,
   Security,
@@ -50,7 +47,7 @@ import { useNavigate } from 'react-router-dom';
 import { toast } from 'react-toastify';
 import copy from 'copy-to-clipboard';
 import dayjs from 'dayjs';
-import api, { keyAPI, apiAPI } from '../../services/api';
+import { keyAPI, apiAPI } from '../../services/api';
 
 const APIKeys = () => {
   const navigate = useNavigate();

@@ -3,8 +3,7 @@ import {
   Box,
   Typography,
   Button,
-  Container,
-  useTheme
+  Container
 } from '@mui/material';
 import {
   Error,
@@ -14,7 +13,6 @@ import {
 import { useNavigate } from 'react-router-dom';
 
 const ErrorBoundary = ({ error, resetError, children }) => {
-  const theme = useTheme();
   const navigate = useNavigate();
 
   if (error) {

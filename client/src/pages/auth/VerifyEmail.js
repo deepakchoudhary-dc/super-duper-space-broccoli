@@ -1,7 +1,5 @@
 import React, { useState, useEffect } from 'react';
 import {
-  Container,
-  Paper,
   Typography,
   Box,
   Alert,
@@ -9,12 +7,11 @@ import {
   Button
 } from '@mui/material';
 import { CheckCircle, Error } from '@mui/icons-material';
-import { Link as RouterLink, useSearchParams, useNavigate } from 'react-router-dom';
+import { Link as RouterLink, useSearchParams } from 'react-router-dom';
 import api from '../../services/api';
 
 const VerifyEmail = () => {
   const [searchParams] = useSearchParams();
-  const navigate = useNavigate();
   const [status, setStatus] = useState('verifying'); // verifying, success, error
   const [message, setMessage] = useState('');
   const [loading, setLoading] = useState(true);

@@ -243,7 +243,7 @@ const templates = {
       <body>
         <div class="container">
           <div class="header">
-            <h1>⚠️ Rate Limit Alert</h1>
+            <h1>Rate Limit Alert</h1>
           </div>
           <div class="content">
             <h2>Rate Limit Exceeded</h2>

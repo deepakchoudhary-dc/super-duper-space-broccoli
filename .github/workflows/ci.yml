@@ -47,10 +47,10 @@ jobs:
         run: npm ci
 
       - name: Run unit tests
-        run: npm run test:server -- --runInBand
+        run: npm run test:server -- --runInBand --forceExit
 
       - name: Run integration tests (real Postgres + Redis)
-        run: npm run test:server -- --runInBand --testPathPattern=integration
+        run: npm run test:server -- --runInBand --testPathPattern=integration --forceExit
         env:
           NODE_ENV: test
           RUN_INTEGRATION: 'true'
@@ -86,3 +86,84 @@ jobs:
 
       - name: Build production bundle
         run: cd client && CI=true npm run build
+
+  perf-gate:
+    name: k6 performance gate (load + cache + rate-limit)
+    runs-on: ubuntu-latest
+    needs: [test-server]
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_DB: api_guardian_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install root dependencies
+        run: npm ci
+
+      - name: Boot the gateway against a local echo upstream
+        env:
+          NODE_ENV: test
+          DB_HOST: localhost
+          DB_PORT: 5432
+          DB_NAME: api_guardian_test
+          DB_USER: postgres
+          DB_PASSWORD: postgres
+          REDIS_HOST: localhost
+          REDIS_PORT: 6379
+          JWT_ACCESS_SECRET: test-access-secret-1234567890-abcdefghijklmnopqrstuvwxyz
+          JWT_REFRESH_SECRET: test-refresh-secret-1234567890-abcdefghijklmnopqrstuvwxyz
+          SKIP_EMAIL_VERIFICATION: 'true'
+          WAF_ENABLED: 'false'
+          SSRF_ALLOW_PRIVATE: '127.0.0.1,localhost'
+        run: |
+          node scripts/k6/echo-upstream.js > /tmp/echo.log 2>&1 &
+          node server/index.js > /tmp/gateway.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:5000/health > /dev/null && break
+            sleep 1
+          done
+          curl -sf http://localhost:5000/health && echo ' gateway up'
+          node scripts/k6/prepare-load-test.js > /tmp/gateway-env.env
+          cat /tmp/gateway-env.env
+
+      - name: Run k6 load gate
+        uses: grafana/setup-k6-action@v1
+        with:
+          # Pin a concrete version: `latest` gets interpolated as vlatest
+          # which does not exist on the releases page (404).
+          k6-version: 2.2.0
+
+      - name: Execute performance gates
+        run: |
+          source /tmp/gateway-env.env
+          export BASE_URL=http://localhost:5000
+          k6 run scripts/k6/smoke.js
+          k6 run scripts/k6/load.js
+          k6 run scripts/k6/cache.js

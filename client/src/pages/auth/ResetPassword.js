@@ -1,7 +1,5 @@
 import React, { useState, useEffect } from 'react';
 import {
-  Container,
-  Paper,
   TextField,
   Button,
   Typography,
@@ -16,7 +14,9 @@ import {
   Visibility,
   VisibilityOff,
   Lock,
-  ArrowBack
+  ArrowBack,
+  Check,
+  RadioButtonUnchecked
 } from '@mui/icons-material';
 import { Link as RouterLink, useNavigate, useSearchParams } from 'react-router-dom';
 import api from '../../services/api';
@@ -207,7 +207,8 @@ const ResetPassword = () => {
                       fontSize: '0.8rem'
                     }}
                   >
-                    {req.met ? '✓' : '○'} {req.text}
+                    {req.met ? <Check sx={{ fontSize: '0.8rem', verticalAlign: 'middle' }} /> : <RadioButtonUnchecked sx={{ fontSize: '0.8rem', verticalAlign: 'middle' }} />}{' '}
+                    {req.text}
                   </Typography>
                 ))}
               </Box>

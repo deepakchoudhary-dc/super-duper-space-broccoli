@@ -132,6 +132,9 @@ const validateUrl = async (urlString, opts = {}) => {
  */
 const isObviousInternal = (hostname) => {
   if (!hostname) return true;
+  // Honor the explicit allowlist (SSRF_ALLOW_PRIVATE) before classifying hosts
+  const allowedPrivate = config.proxy.ssrfAllowPrivate || [];
+  if (allowedPrivate.includes(hostname)) return false;
   if (hostname === 'localhost' || hostname.endsWith('.localhost')) return true;
   if (hostname.endsWith('.local') || hostname.endsWith('.internal')) return true;
   if (net.isIP(hostname) && isPrivateIp(hostname)) return true;

@@ -31,7 +31,6 @@ import {
   ContentCopy,
   Download,
   Security,
-  Settings,
   Visibility,
   VisibilityOff
 } from '@mui/icons-material';
@@ -58,6 +57,9 @@ const CreateAPIKey = () => {
     apiId: '',
     permissions: [],
     rateLimit: 1000,
+    burstLimit: 0,
+    hourlyLimit: 0,
+    dailyLimit: 0,
     ipWhitelist: [],
     expiresAt: dayjs().add(1, 'year'),
     environment: 'production'
@@ -190,6 +192,8 @@ const CreateAPIKey = () => {
         if (formData.rateLimit < 1) {
           newErrors.rateLimit = 'Rate limit must be at least 1';
         }
+        break;
+      default:
         break;
     }
 
@@ -386,15 +390,51 @@ const CreateAPIKey = () => {
             </Typography>
             <TextField
               fullWidth
-              label="Requests per hour"
+              label="Base limit (requests per window)"
               type="number"
               value={formData.rateLimit}
               onChange={(e) => handleChange('rateLimit', parseInt(e.target.value) || 0)}
               error={!!errors.rateLimit}
-              helperText={errors.rateLimit || 'Maximum number of requests allowed per hour'}
+              helperText={errors.rateLimit || 'Maximum requests per rateLimitWindow (default 3600s)'}
               margin="normal"
               inputProps={{ min: 1 }}
             />
+
+            <Grid container spacing={2} mt={0.5}>
+              <Grid item xs={12} sm={4}>
+                <TextField
+                  fullWidth
+                  label="Burst (per second)"
+                  type="number"
+                  value={formData.burstLimit}
+                  onChange={(e) => handleChange('burstLimit', parseInt(e.target.value) || 0)}
+                  helperText="0 = off"
+                  inputProps={{ min: 0 }}
+                />
+              </Grid>
+              <Grid item xs={12} sm={4}>
+                <TextField
+                  fullWidth
+                  label="Hourly cap"
+                  type="number"
+                  value={formData.hourlyLimit}
+                  onChange={(e) => handleChange('hourlyLimit', parseInt(e.target.value) || 0)}
+                  helperText="0 = off"
+                  inputProps={{ min: 0 }}
+                />
+              </Grid>
+              <Grid item xs={12} sm={4}>
+                <TextField
+                  fullWidth
+                  label="Daily cap"
+                  type="number"
+                  value={formData.dailyLimit}
+                  onChange={(e) => handleChange('dailyLimit', parseInt(e.target.value) || 0)}
+                  helperText="0 = off"
+                  inputProps={{ min: 0 }}
+                />
+              </Grid>
+            </Grid>
 
             <Divider sx={{ my: 3 }} />
 
